@@ -1617,7 +1617,10 @@ def format_in_stock_result_for_alert(site_result: dict) -> str:
         f"連結: {product_url}",
     ]
     if "added_to_cart" in stock:
-        add_text = "成功" if stock.get("added_to_cart") else "失敗"
+        if not APP.auto_add_to_cart:
+            add_text = "未啟用"
+        else:
+            add_text = "成功" if stock.get("added_to_cart") else "失敗"
         lines.append(f"自動加入購物車: {add_text}")
     lines.append(f"寄送 {APP.target_country_name}: {shipping.get('status', 'UNKNOWN')}")
     return "\n".join(lines)
