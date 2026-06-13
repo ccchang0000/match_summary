@@ -3,9 +3,9 @@ name: Matcha Monitor
 # Runs the stock check on a schedule (one-shot per run; cron drives the repetition).
 on:
   schedule:
-    # Every 5 minutes (the shortest interval GitHub allows). Public repo = unlimited free minutes.
-    # Note: GitHub often delays short schedules and may skip runs under load, so actual spacing varies.
-    - cron: "*/5 * * * *"
+    # Every 15 minutes. Shorter intervals like */5 are throttled/skipped hardest by GitHub,
+    # so */15 is actually more reliable. GitHub still delays schedules under load; spacing varies.
+    - cron: "*/15 * * * *"
   workflow_dispatch: {}   # lets you trigger a run manually from the Actions tab
 
 # Don't let a slow run overlap with the next scheduled one.
