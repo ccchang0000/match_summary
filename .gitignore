@@ -1,0 +1,17 @@
+# Secrets — NEVER commit
+.env
+
+# Python / venv
+.venv/
+__pycache__/
+*.pyc
+
+# Runtime output
+logs/
+state/
+*.log
+*.log.*
+*.lock
+
+# Local backup of the pre-optimization script (not needed in the repo)
+matcha_multi_monitor_backup_*.py

@@ -1,0 +1,77 @@
+name: Matcha Monitor
+
+# Runs the stock check on a schedule (one-shot per run; cron drives the repetition).
+on:
+  schedule:
+    # Every 30 minutes (UTC). GitHub may delay or occasionally skip scheduled runs.
+    # Public repo = unlimited free minutes, so you can go more frequent (min interval 5 min: "*/5 * * * *").
+    # Private repo = 2000 free min/month, so keep the interval >= ~30-60 min.
+    - cron: "*/30 * * * *"
+  workflow_dispatch: {}   # lets you trigger a run manually from the Actions tab
+
+# Don't let a slow run overlap with the next scheduled one.
+concurrency:
+  group: matcha-monitor
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # Restore the "already alerted" state from the previous run so we don't
+      # re-notify the same in-stock product every cycle. Picks the most recent cache.
+      - name: Restore alert state
+        uses: actions/cache/restore@v4
+        with:
+          path: state
+          key: matcha-alert-state-${{ github.run_id }}
+          restore-keys: |
+            matcha-alert-state-
+
+      - name: Run monitor (one-shot)
+        env:
+          RUN_ONCE: "true"
+          SINGLE_INSTANCE: "false"
+          SITE_PROFILES: "horii,koyamaen,ippodo"
+          # Server has no desktop and an ephemeral cart — rely on Telegram only.
+          ENABLE_LOCAL_NOTIFICATION: "false"
+          AUTO_ADD_TO_CART: "false"
+          ALERT_WHEN_ANY_IN_STOCK: "true"
+          ALERT_ON_UNKNOWN_STOCK: "false"
+          # Runner has proper CA certs, so verify TLS for both shops and Telegram.
+          VERIFY_SSL: "true"
+          TELEGRAM_VERIFY_SSL: "true"
+          # Persisted across runs via the cache steps above/below.
+          ALERT_STATE_FILE: "state/matcha_alert_state.json"
+          # Log in only for Koyamaen (needed to read its ship-to-Taiwan option).
+          # Global ENABLE_LOGIN stays false so Shopify sites don't attempt doomed logins.
+          KOYAMAEN_ENABLE_LOGIN: "true"
+          # Secrets — set these under repo Settings > Secrets and variables > Actions.
+          TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
+          TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          KOYAMAEN_LOGIN_EMAIL: ${{ secrets.KOYAMAEN_LOGIN_EMAIL }}
+          KOYAMAEN_LOGIN_PASSWORD: ${{ secrets.KOYAMAEN_LOGIN_PASSWORD }}
+        run: python matcha_multi_monitor.py
+
+      - name: Save alert state
+        if: always()
+        uses: actions/cache/save@v4
+        with:
+          path: state
+          key: matcha-alert-state-${{ github.run_id }}
