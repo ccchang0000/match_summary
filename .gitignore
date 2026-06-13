@@ -15,3 +15,6 @@ state/
 
 # Local backup of the pre-optimization script (not needed in the repo)
 matcha_multi_monitor_backup_*.py
+
+# Personal ops manual — keep local, do not publish
+matcha_multi_monitor_manual.md
