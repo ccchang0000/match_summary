@@ -80,14 +80,18 @@ jobs:
           TELEGRAM_VERIFY_SSL: "true"
           # Persisted across runs via the cache steps above/below.
           ALERT_STATE_FILE: "state/matcha_alert_state.json"
-          # NO login in this frequent run — stock is detectable without logging in.
-          # Koyamaen's ship-to-Taiwan status (which needs login) is refreshed only a
-          # couple of times a day by matcha_shipping.yml, so we don't log in every cycle
-          # (logging in every 15 min looks bot-like and risks the Koyamaen account).
-          KOYAMAEN_ENABLE_LOGIN: "false"
+          # Login is ENABLED but LAZY: matcha_multi_monitor.py only logs in when a NEW
+          # in-stock product appears (see check_site_once / site_has_unalerted_in_stock).
+          # Empty stock = no login, and a product that stays in stock is not re-logged-in,
+          # so we keep avoiding the "logging in every 15 min looks bot-like" risk while
+          # refreshing Koyamaen's ship-to-Taiwan status in the SAME cycle stock is found.
+          # (This replaces the old separate matcha_shipping.yml, now retired.)
+          KOYAMAEN_ENABLE_LOGIN: "true"
           # Secrets — set these under repo Settings > Secrets and variables > Actions.
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
+          KOYAMAEN_LOGIN_EMAIL: ${{ secrets.KOYAMAEN_LOGIN_EMAIL }}
+          KOYAMAEN_LOGIN_PASSWORD: ${{ secrets.KOYAMAEN_LOGIN_PASSWORD }}
         run: python matcha_multi_monitor.py
 
       - name: Save alert state

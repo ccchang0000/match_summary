@@ -1726,7 +1726,31 @@ def format_site_result_for_alert(site_result: dict) -> str:
     return f"[{cfg.site_name}]\n{login_text}\n\n{stock_text}\n\n{shipping_text}\n"
 
 
-def check_site_once(cfg: SiteConfig) -> dict:
+def site_has_unalerted_in_stock(cfg: SiteConfig, stock_result: dict, alerted_keys: set) -> bool:
+    """True if this site is IN_STOCK with at least one product we have NOT alerted yet.
+
+    Drives the "log in only when needed" rule: we refresh Koyamaen's ship-to-Taiwan
+    status the moment a NEW product appears, never on empty stock and never again while
+    the same product stays in stock. That keeps logins rare (so the 15-minute run does
+    not look bot-like / risk the Koyamaen account) while still answering "can it ship to
+    Taiwan?" exactly when it matters."""
+    if stock_result.get("status") != "IN_STOCK":
+        return False
+    products = stock_result.get("in_stock_products") or [stock_result]
+    for product in products:
+        key = in_stock_alert_key({"config": cfg, "stock_result": product})
+        if key not in alerted_keys:
+            return True
+    return False
+
+
+def check_site_once(cfg: SiteConfig, alerted_keys=None) -> dict:
+    # alerted_keys lets us tell a brand-new in-stock product (→ log in + refresh shipping)
+    # from one we already alerted (→ skip the login). Loaded once per run by the caller;
+    # default-load here so direct/test calls still work.
+    if alerted_keys is None:
+        alerted_keys = load_alerted_in_stock_keys()
+
     site_result = {"config": cfg}
     write_site_log(cfg, "=" * 80)
     write_site_log(cfg, f"Starting {cfg.site_name} stock and {APP.target_country_name} shipping check")
@@ -1737,15 +1761,25 @@ def check_site_once(cfg: SiteConfig) -> dict:
 
     session = build_session()
     try:
-        login_result = login_to_member_account(session, cfg)
-        site_result["login_result"] = login_result
-        write_site_log(cfg, f"Member login status: {login_result['status']}")
-        write_site_log(cfg, login_result["message"])
-
+        # Stock is detectable WITHOUT logging in, so check it first. Only when a new
+        # in-stock product shows up (and login is enabled for this site) do we log in,
+        # add to cart, and re-check ship-to-Taiwan — all in this same run.
         html = fetch_page(session, cfg, cfg.product_url)
         stock_result = parse_stock_status(session, cfg, html)
+        site_result["stock_result"] = stock_result
 
-        if stock_result["status"] == "IN_STOCK":
+        follow_up = (
+            stock_result["status"] == "IN_STOCK"
+            and cfg.enable_login
+            and site_has_unalerted_in_stock(cfg, stock_result, alerted_keys)
+        )
+
+        if follow_up:
+            login_result = login_to_member_account(session, cfg)
+            site_result["login_result"] = login_result
+            write_site_log(cfg, f"Member login status: {login_result['status']}")
+            write_site_log(cfg, login_result["message"])
+
             products = stock_result.get("in_stock_products") or [stock_result]
             for product in products:
                 added_to_cart = add_product_to_cart(
@@ -1755,8 +1789,16 @@ def check_site_once(cfg: SiteConfig) -> dict:
                 write_site_log(cfg, f"Auto add-to-cart result for {product_result_label(product)}: {added_to_cart}")
             stock_result["added_to_cart"] = products[0].get("added_to_cart") if products else None
 
-        shipping_result = check_shipping_to_target(session, cfg)
-        site_result["stock_result"] = stock_result
+            shipping_result = check_shipping_to_target(session, cfg)
+        else:
+            # Out of stock, login disabled, or already alerted (we logged in on an earlier
+            # run). Skip the login/cart/shipping round-trip to keep logins minimal.
+            shipping_result = {
+                "status": "UNKNOWN",
+                "message": "Shipping check skipped: only runs when a new in-stock product appears with login enabled.",
+                "url": ", ".join(cfg.shipping_check_urls),
+            }
+
         site_result["shipping_result"] = shipping_result
 
         write_site_log(cfg, f"Stock status: {stock_result['status']}")
@@ -1782,13 +1824,17 @@ def check_all_sites_once(configs: list[SiteConfig]) -> list[dict]:
     if not enabled:
         return []
 
+    # Load the de-dup state once so every site sees the same "already alerted" snapshot
+    # when deciding whether this is a new in-stock product worth logging in for.
+    alerted_keys = load_alerted_in_stock_keys()
+
     workers = max(1, min(APP.max_site_workers, len(enabled)))
     if workers == 1:
-        return [check_site_once(cfg) for cfg in enabled]
+        return [check_site_once(cfg, alerted_keys) for cfg in enabled]
 
     # Sites are independent (own session per call); run them concurrently. map() preserves order.
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        return list(executor.map(check_site_once, enabled))
+        return list(executor.map(lambda cfg: check_site_once(cfg, alerted_keys), enabled))
 
 
 def send_summary_if_needed(results: list[dict]) -> None:
