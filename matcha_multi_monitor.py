@@ -236,6 +236,7 @@ class AppConfig:
     enable_local_notification: bool
     test_telegram: bool
     simulate_in_stock: bool
+    debug: bool
     summary_alert_every_run: bool
     alert_when_any_in_stock: bool
     local_notification_title_max_chars: int
@@ -280,6 +281,7 @@ class AppConfig:
             enable_local_notification=env_bool("ENABLE_LOCAL_NOTIFICATION", "true"),
             test_telegram=env_bool("TEST_TELEGRAM", "false"),
             simulate_in_stock=env_bool("SIMULATE_IN_STOCK", "false"),
+            debug=env_bool("DEBUG", "false"),
             summary_alert_every_run=env_bool("SUMMARY_ALERT_EVERY_RUN", "false"),
             alert_when_any_in_stock=env_bool("ALERT_WHEN_ANY_IN_STOCK", "true"),
             local_notification_title_max_chars=env_int("LOCAL_NOTIFICATION_TITLE_MAX_CHARS", 63),
@@ -489,10 +491,29 @@ def send_local_notification(title: str, message: str) -> bool:
     return True
 
 
+def telegram_error_hint(status_code: int, description: str) -> str:
+    """Human-friendly hint for common Telegram sendMessage failures (channel setup, etc.)."""
+    desc = (description or "").lower()
+    if status_code == 401:
+        return " — TELEGRAM_BOT_TOKEN looks invalid or revoked."
+    if status_code == 404:
+        return " — bot token path not found; check TELEGRAM_BOT_TOKEN."
+    if "chat not found" in desc:
+        return " — TELEGRAM_CHAT_ID is wrong, or the bot was never added to the channel."
+    if status_code == 403 or "not a member" in desc or "kicked" in desc or "bot was blocked" in desc:
+        return " — bot is not a member/admin of the channel (or was blocked). Add it as admin with post rights."
+    if "not enough rights" in desc or "need administrator" in desc or "have no rights" in desc:
+        return " — bot needs admin / post-messages permission in the channel."
+    if "chat_id is empty" in desc or "chat_id" in desc:
+        return " — TELEGRAM_CHAT_ID is empty or malformed. Use a numeric id, @public_channel, or -100... id."
+    return ""
+
+
 def send_telegram_alert(title: str, message: str) -> bool:
     token = os.getenv("TELEGRAM_BOT_TOKEN")
     chat_id = os.getenv("TELEGRAM_CHAT_ID")
     if not token or not chat_id:
+        write_global_log("Telegram alert skipped: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing.")
         return False
 
     url = f"https://api.telegram.org/bot{token}/sendMessage"
@@ -504,9 +525,21 @@ def send_telegram_alert(title: str, message: str) -> bool:
             timeout=20,
             verify=APP.telegram_verify_ssl,
         )
-        response.raise_for_status()
     except requests.RequestException as e:
-        raise RuntimeError(type(e).__name__) from None
+        # NOTE: never log the exception message/URL — it can contain the bot token.
+        write_global_log(f"Telegram send failed: request error ({type(e).__name__}).")
+        raise RuntimeError(f"Telegram request error: {type(e).__name__}") from None
+
+    if not response.ok:
+        description = ""
+        try:
+            description = (response.json() or {}).get("description", "")
+        except ValueError:
+            description = trim_text(response.text, 200)
+        hint = telegram_error_hint(response.status_code, description)
+        # Telegram's JSON description does not contain the token; safe to log.
+        write_global_log(f"Telegram send failed: HTTP {response.status_code} {description}{hint}")
+        raise RuntimeError(f"Telegram HTTP {response.status_code}: {description}") from None
 
     write_global_log("Telegram alert sent")
     return True
@@ -1064,7 +1097,42 @@ def page_has_product_data(text: str, html: str = "") -> bool:
     return has_sku or 'id="ProductJson' in html or 'action="/cart/add"' in html or "action='/cart/add'" in html or "cart/add" in html
 
 
+# Markers that strongly indicate a Cloudflare / anti-bot interstitial rather than
+# a real product page. Kept deliberately specific (NOT a bare "cloudflare" match)
+# because many legit sites load assets from cdnjs.cloudflare.com and would otherwise
+# be misflagged. We do not guess from "too few product elements" for the same reason.
+CHALLENGE_PAGE_MARKERS = (
+    "cf-chl",
+    "challenge-platform",
+    "/cdn-cgi/challenge-platform",
+    "just a moment...",
+    "checking your browser before accessing",
+    "attention required! | cloudflare",
+    "enable javascript and cookies to continue",
+)
+
+
+def looks_like_blocked_or_challenge_page(html: str) -> bool:
+    """True if the HTML looks like an anti-bot challenge / block page, not a product page."""
+    if not html:
+        return False
+    lowered = html.lower()
+    return any(marker in lowered for marker in CHALLENGE_PAGE_MARKERS)
+
+
 def parse_single_product_stock(html: str, product_url: str) -> dict:
+    if looks_like_blocked_or_challenge_page(html):
+        write_global_log("Possible Cloudflare / anti-bot challenge page detected; stock status set to UNKNOWN.")
+        if APP.debug:
+            write_global_log(f"Challenge page for {product_url}; sample: {trim_text(page_text(html), 300)}")
+        return {
+            "status": "UNKNOWN",
+            "message": "Possible Cloudflare / anti-bot challenge page; stock status could not be confirmed.",
+            "url": product_url,
+            "product_name": "",
+            "page_text_sample": page_text(html)[:800],
+        }
+
     soup = BeautifulSoup(html, "html.parser")
     text = page_text(html)
     stock_text = remove_sitewide_stock_notice(text)
@@ -1092,7 +1160,6 @@ def parse_single_product_stock(html: str, product_url: str) -> dict:
     is_sold_out = any(keyword in text_lower for keyword in sold_out_keywords)
     has_cart_control = has_enabled_add_to_cart_control(soup)
     login_required = "you must register and login to shop" in text_lower
-    has_product_data = page_has_product_data(stock_text, html)
 
     if is_sold_out:
         return {
@@ -1110,10 +1177,16 @@ def parse_single_product_stock(html: str, product_url: str) -> dict:
             "product_name": product_name,
             "page_text_sample": text[:800],
         }
-    if login_required and has_product_data:
+    if login_required:
+        # A login wall on its own is NOT proof of stock. Without an enabled
+        # add-to-cart control or explicit availability data we cannot confirm
+        # the product is buyable, so stay conservative and report UNKNOWN
+        # rather than risk a false "in stock" alert.
+        if APP.debug:
+            write_global_log(f"Login required, stock unconfirmed for {product_url}; sample: {trim_text(stock_text, 300)}")
         return {
-            "status": "IN_STOCK",
-            "message": product_name and f"{product_name} does not show a product-specific sold-out notice; login is required to shop." or "Product does not show a product-specific sold-out notice; login is required to shop.",
+            "status": "UNKNOWN",
+            "message": product_name and f"Login required and stock could not be confirmed for {product_name}." or "Login required and stock could not be confirmed.",
             "url": product_url,
             "product_name": product_name,
             "page_text_sample": text[:800],
@@ -1788,6 +1861,7 @@ def main() -> None:
     write_global_log(f"ENABLE_LOCAL_NOTIFICATION: {APP.enable_local_notification}")
     write_global_log(f"TEST_TELEGRAM: {APP.test_telegram}")
     write_global_log(f"SIMULATE_IN_STOCK: {APP.simulate_in_stock}")
+    write_global_log(f"DEBUG: {APP.debug}")
     write_global_log(f"SUMMARY_ALERT_EVERY_RUN: {APP.summary_alert_every_run}")
     write_global_log(f"TARGET_COUNTRY_NAME: {APP.target_country_name}")
     write_global_log(f"TARGET_COUNTRY_CODE: {APP.target_country_code}")

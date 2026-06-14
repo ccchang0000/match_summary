@@ -6,7 +6,24 @@ on:
     # Every 15 minutes. Shorter intervals like */5 are throttled/skipped hardest by GitHub,
     # so */15 is actually more reliable. GitHub still delays schedules under load; spacing varies.
     - cron: "*/15 * * * *"
-  workflow_dispatch: {}   # lets you trigger a run manually from the Actions tab
+  workflow_dispatch:   # lets you trigger a run manually from the Actions tab
+    inputs:
+      profiles:
+        description: "Comma-separated site profiles to run, e.g. koyamaen or horii,koyamaen,ippodo"
+        required: false
+        default: "horii,koyamaen,ippodo"
+      test_telegram:
+        description: "Send a test Telegram message and exit (verifies channel setup)"
+        type: boolean
+        default: false
+      simulate_in_stock:
+        description: "Pretend a product is in stock to exercise the alert path"
+        type: boolean
+        default: false
+      debug:
+        description: "More verbose logging (never prints secrets)"
+        type: boolean
+        default: false
 
 # Don't let a slow run overlap with the next scheduled one.
 concurrency:
@@ -47,7 +64,12 @@ jobs:
         env:
           RUN_ONCE: "true"
           SINGLE_INSTANCE: "false"
-          SITE_PROFILES: "horii,koyamaen,ippodo"
+          # On manual runs these come from the workflow_dispatch inputs above;
+          # on scheduled runs the inputs are empty, so the defaults apply.
+          SITE_PROFILES: ${{ github.event.inputs.profiles || 'horii,koyamaen,ippodo' }}
+          TEST_TELEGRAM: ${{ github.event.inputs.test_telegram || 'false' }}
+          SIMULATE_IN_STOCK: ${{ github.event.inputs.simulate_in_stock || 'false' }}
+          DEBUG: ${{ github.event.inputs.debug || 'false' }}
           # Server has no desktop and an ephemeral cart — rely on Telegram only.
           ENABLE_LOCAL_NOTIFICATION: "false"
           AUTO_ADD_TO_CART: "false"
