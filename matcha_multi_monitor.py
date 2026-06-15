@@ -600,6 +600,23 @@ def page_text(html: str) -> str:
     return soup.get_text(" ", strip=True)
 
 
+def save_koyamaen_unknown_html(cfg: SiteConfig, product_url: str, html: str, result: dict) -> None:
+    if cfg.profile != "koyamaen" or not APP.debug:
+        return
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    filename = f"koyamaen_unknown_{timestamp}.html"
+    path = os.path.join(APP.log_dir, filename)
+    sample = trim_text(result.get("page_text_sample") or page_text(html), 500)
+    try:
+        os.makedirs(APP.log_dir, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(html or "")
+        write_site_log(cfg, f"Koyamaen UNKNOWN HTML saved: {path}")
+    except Exception as e:
+        write_site_log(cfg, f"Koyamaen UNKNOWN HTML save failed: {e}")
+    write_site_log(cfg, f"Koyamaen UNKNOWN page_text_sample: {sample}")
+
+
 # ============================================================
 # Member login
 # ============================================================
@@ -841,21 +858,104 @@ def remove_sitewide_stock_notice(text: str) -> str:
 
 
 def parse_product_name(soup: BeautifulSoup) -> str:
-    generic_names = {"product detail", "products", "matcha"}
-    title = soup.select_one("title")
-    if title:
-        name = title.get_text(" ", strip=True).split("|", 1)[0].strip()
-        if name and name.lower() not in generic_names:
-            return name
+    generic_names = {"product detail", "products", "matcha", "just a moment...", "attention required!"}
     heading = soup.select_one("h1")
     if heading:
         name = heading.get_text(" ", strip=True)
         if name and name.lower() not in generic_names:
             return name
+    title = soup.select_one("title")
+    if title:
+        name = title.get_text(" ", strip=True).split("|", 1)[0].strip()
+        if name and name.lower() not in generic_names:
+            return name
     return ""
 
 
+SOLD_OUT_KEYWORDS = (
+    "this product is currently out of stock and unavailable",
+    "this product is currently out of stock",
+    "currently out of stock and unavailable",
+    "currently out of stock",
+    "out of stock and unavailable",
+    "out of stock",
+    "sold out",
+    "売り切れ",
+    "在庫切れ",
+    "お取り扱いできません",
+    "憯脯???",
+    "?典澈??",
+    "???????",
+)
+
+IN_STOCK_KEYWORDS = (
+    "カートに入れる",
+    "add to cart",
+    "add-to-cart",
+)
+
+
+def has_sold_out_keyword(text: str) -> bool:
+    text_lower = (text or "").casefold()
+    return any(keyword.casefold() in text_lower for keyword in SOLD_OUT_KEYWORDS)
+
+
+def tag_bits(tag) -> str:
+    values = [
+        tag.get("id"),
+        tag.get("name"),
+        tag.get("value"),
+        tag.get("aria-label"),
+        tag.get("href"),
+        tag.get("action"),
+        " ".join(tag.get("class", [])),
+        tag.get_text(" ", strip=True),
+    ]
+    return " ".join(value or "" for value in values).casefold()
+
+
+def is_disabled_control(tag) -> bool:
+    return tag.has_attr("disabled") or (tag.get("aria-disabled") or "").lower() == "true"
+
+
+def has_cart_form_or_add_to_cart_signal(soup: BeautifulSoup) -> bool:
+    if soup.select_one('a[href*="add-to-cart="], a[href*="add-to-cart"], [class*="add-to-cart"], [id*="add-to-cart"]'):
+        return True
+    for form in soup.select("form"):
+        bits = tag_bits(form)
+        if "cart" in bits or "カート" in bits:
+            return True
+    for control in soup.select("button, input[type='submit'], input[type='button']"):
+        bits = tag_bits(control)
+        if any(keyword.casefold() in bits for keyword in IN_STOCK_KEYWORDS) or ("add" in bits and "cart" in bits):
+            return True
+    return False
+
+
 def has_enabled_add_to_cart_control(soup: BeautifulSoup) -> bool:
+    for link in soup.select('a[href*="add-to-cart="], a[href*="add-to-cart"]'):
+        if not is_disabled_control(link):
+            return True
+
+    for control in soup.select("button, input[type='submit'], input[type='button']"):
+        if is_disabled_control(control):
+            continue
+        control_bits = tag_bits(control)
+        if has_sold_out_keyword(control_bits):
+            continue
+        if any(keyword.casefold() in control_bits for keyword in IN_STOCK_KEYWORDS) or ("add" in control_bits and "cart" in control_bits):
+            return True
+
+    for cart_form in soup.select("form.cart, form[action*='/cart/add'], form[action*='cart/add'], form[action*='cart'], form.product-form"):
+        form_bits = tag_bits(cart_form)
+        if "sold-out" in form_bits or "variant-sold-out" in form_bits or has_sold_out_keyword(form_bits):
+            continue
+        if "cart" in form_bits:
+            return True
+        for control in cart_form.select("button, input[type='submit'], input[type='button']"):
+            if not is_disabled_control(control) and not has_sold_out_keyword(tag_bits(control)):
+                return True
+
     if soup.select_one('a[href*="add-to-cart="]'):
         return True
 
@@ -1097,10 +1197,9 @@ def page_has_product_data(text: str, html: str = "") -> bool:
     return has_sku or 'id="ProductJson' in html or 'action="/cart/add"' in html or "action='/cart/add'" in html or "cart/add" in html
 
 
-# Markers that strongly indicate a Cloudflare / anti-bot interstitial rather than
-# a real product page. Kept deliberately specific (NOT a bare "cloudflare" match)
-# because many legit sites load assets from cdnjs.cloudflare.com and would otherwise
-# be misflagged. We do not guess from "too few product elements" for the same reason.
+# Challenge detection is intentionally strict and runs only after product parsing.
+# Koyamaen product pages can include Cloudflare JavaScript while still being real
+# product HTML, so single markers like cf-chl are never enough on their own.
 CHALLENGE_PAGE_MARKERS = (
     "cf-chl",
     "challenge-platform",
@@ -1112,31 +1211,38 @@ CHALLENGE_PAGE_MARKERS = (
 )
 
 
-def looks_like_blocked_or_challenge_page(html: str) -> bool:
-    """True if the HTML looks like an anti-bot challenge / block page, not a product page."""
+def looks_like_blocked_or_challenge_page(
+    html: str,
+    soup: BeautifulSoup | None = None,
+    stock_text: str = "",
+    has_cart_control: bool = False,
+) -> bool:
+    """True only for a clear anti-bot page with no product/stock signals."""
     if not html:
         return False
     lowered = html.lower()
-    return any(marker in lowered for marker in CHALLENGE_PAGE_MARKERS)
+    soup = soup or BeautifulSoup(html, "html.parser")
+    title = soup.select_one("title")
+    title_text = title.get_text(" ", strip=True).casefold() if title else ""
+    has_challenge_title = title_text in {"just a moment...", "attention required! | cloudflare"}
+    has_challenge_platform = "/cdn-cgi/challenge-platform" in lowered
+    has_product_heading = bool(soup.select_one("h1") and parse_product_name(soup))
+    has_product_stock_text = has_sold_out_keyword(stock_text)
+    has_cart_signal = has_cart_control or has_cart_form_or_add_to_cart_signal(soup)
+    return (
+        has_challenge_title
+        and has_challenge_platform
+        and not has_product_heading
+        and not has_cart_signal
+        and not has_product_stock_text
+    )
 
 
 def parse_single_product_stock(html: str, product_url: str) -> dict:
-    if looks_like_blocked_or_challenge_page(html):
-        write_global_log("Possible Cloudflare / anti-bot challenge page detected; stock status set to UNKNOWN.")
-        if APP.debug:
-            write_global_log(f"Challenge page for {product_url}; sample: {trim_text(page_text(html), 300)}")
-        return {
-            "status": "UNKNOWN",
-            "message": "Possible Cloudflare / anti-bot challenge page; stock status could not be confirmed.",
-            "url": product_url,
-            "product_name": "",
-            "page_text_sample": page_text(html)[:800],
-        }
-
     soup = BeautifulSoup(html, "html.parser")
     text = page_text(html)
     stock_text = remove_sitewide_stock_notice(text)
-    text_lower = stock_text.lower()
+    text_lower = stock_text.casefold()
     product_name = parse_product_name(soup)
 
     shopify_result = parse_embedded_shopify_stock(soup, product_url, text[:800])
@@ -1157,7 +1263,7 @@ def parse_single_product_stock(html: str, product_url: str) -> dict:
         "在庫切れ",
         "お取り扱いできません",
     ]
-    is_sold_out = any(keyword in text_lower for keyword in sold_out_keywords)
+    is_sold_out = has_sold_out_keyword(stock_text)
     has_cart_control = has_enabled_add_to_cart_control(soup)
     login_required = "you must register and login to shop" in text_lower
 
@@ -1175,6 +1281,17 @@ def parse_single_product_stock(html: str, product_url: str) -> dict:
             "message": product_name and f"{product_name} appears to be available." or "Product appears to be available.",
             "url": product_url,
             "product_name": product_name,
+            "page_text_sample": text[:800],
+        }
+    if looks_like_blocked_or_challenge_page(html, soup, stock_text, has_cart_control):
+        write_global_log("Cloudflare / anti-bot challenge page detected after product parsing; stock status set to UNKNOWN.")
+        if APP.debug:
+            write_global_log(f"Challenge page for {product_url}; sample: {trim_text(text, 500)}")
+        return {
+            "status": "UNKNOWN",
+            "message": "Cloudflare / anti-bot challenge page; stock status could not be confirmed.",
+            "url": product_url,
+            "product_name": "",
             "page_text_sample": text[:800],
         }
     if login_required:
@@ -1377,7 +1494,29 @@ def parse_product_detail_stock(session: requests.Session, cfg: SiteConfig, produ
         return parse_shopify_product_stock(shopify_product_data, product_url)
 
     product_html = fetch_page(session, cfg, product_url)
-    return parse_single_product_stock(product_html, product_url)
+    result = parse_single_product_stock(product_html, product_url)
+    if result.get("status") != "UNKNOWN" or cfg.profile != "koyamaen":
+        return result
+
+    if cfg.enable_login:
+        login_attempted = getattr(session, "_koyamaen_stock_login_attempted", False)
+        if not login_attempted:
+            setattr(session, "_koyamaen_stock_login_attempted", True)
+            write_site_log(cfg, f"Koyamaen stock UNKNOWN before login; retrying after member login: {product_url}")
+            login_result = login_to_member_account(session, cfg)
+            write_site_log(cfg, f"Koyamaen stock retry login status: {login_result['status']}")
+            write_site_log(cfg, login_result["message"])
+
+        retry_html = fetch_page(session, cfg, product_url)
+        retry_result = parse_single_product_stock(retry_html, product_url)
+        if retry_result.get("status") != "UNKNOWN":
+            write_site_log(cfg, f"Koyamaen stock retry resolved: {retry_result['status']} - {product_url}")
+            return retry_result
+        save_koyamaen_unknown_html(cfg, product_url, retry_html, retry_result)
+        return retry_result
+
+    save_koyamaen_unknown_html(cfg, product_url, product_html, result)
+    return result
 
 
 def parse_stock_status(session: requests.Session, cfg: SiteConfig, html: str) -> dict:
@@ -1388,6 +1527,8 @@ def parse_stock_status(session: requests.Session, cfg: SiteConfig, html: str) ->
     product_urls = build_product_urls(html, cfg)
     if not product_urls:
         result = parse_single_product_stock(html, cfg.product_url)
+        if result.get("status") == "UNKNOWN":
+            save_koyamaen_unknown_html(cfg, cfg.product_url, html, result)
         if is_target_product(cfg, result.get("product_name", ""), result.get("url", cfg.product_url)):
             return result
         return {
