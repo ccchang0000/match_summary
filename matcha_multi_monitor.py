@@ -1440,6 +1440,17 @@ def summarize_stock_results(cfg: SiteConfig, results: list[dict], source_url: st
     }
 
 
+def should_retry_koyamaen_unknown_after_login(cfg: SiteConfig, result: dict, product_url: str) -> bool:
+    if cfg.profile != "koyamaen" or result.get("status") != "UNKNOWN":
+        return False
+    if not cfg.target_product_name_keys and not cfg.target_product_url_keys:
+        return True
+    if normalize_url_key(product_url) in cfg.target_product_url_keys:
+        return True
+    product_name = result.get("product_name") or ""
+    return bool(product_name and is_target_product(cfg, product_name, product_url))
+
+
 def parse_collection_products_json_stock(session: requests.Session, cfg: SiteConfig):
     if not cfg.use_shopify_products_json or not cfg.shopify_products_json_url:
         return None
@@ -1496,6 +1507,11 @@ def parse_product_detail_stock(session: requests.Session, cfg: SiteConfig, produ
     product_html = fetch_page(session, cfg, product_url)
     result = parse_single_product_stock(product_html, product_url)
     if result.get("status") != "UNKNOWN" or cfg.profile != "koyamaen":
+        return result
+
+    if not should_retry_koyamaen_unknown_after_login(cfg, result, product_url):
+        write_site_log(cfg, f"Koyamaen stock UNKNOWN for non-target product; login retry skipped: {product_url}")
+        save_koyamaen_unknown_html(cfg, product_url, product_html, result)
         return result
 
     if cfg.enable_login:
