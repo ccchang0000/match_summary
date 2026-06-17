@@ -106,11 +106,8 @@ SITE_DEFAULTS = {
         "login_url": "https://www.marukyu-koyamaen.co.jp/english/shop/account",
         "shopify_products_json_url": "",
         "use_shopify_products_json": "false",
-        "target_product_names": "Yugen,Chigi no Shiro,Isuzu,Aoarashi,Wako",
-        "target_product_urls": (
-            "https://www.marukyu-koyamaen.co.jp/english/shop/products/1f6d000cc,"
-            "https://www.marukyu-koyamaen.co.jp/english/shop/products/1gaf000cc"
-        ),
+        "target_product_names": "",
+        "target_product_urls": "",
         "product_link_href_parts": "/english/shop/products/",
         "shipping_check_urls": (
             "https://www.marukyu-koyamaen.co.jp/english/shop/cart,"
@@ -766,6 +763,11 @@ def login_failure_reason(html: str) -> str:
     return "login success could not be confirmed"
 
 
+def safe_login_form_fields(data: dict) -> dict:
+    sensitive_names = ("password", "username", "email", "login", "user")
+    return {key: ("***" if any(name in key.lower() for name in sensitive_names) else value) for key, value in data.items()}
+
+
 def login_to_member_account(session: requests.Session, cfg: SiteConfig) -> dict:
     if not cfg.enable_login:
         return {"status": "DISABLED", "message": "Member login is disabled."}
@@ -790,7 +792,7 @@ def login_to_member_account(session: requests.Session, cfg: SiteConfig) -> dict:
     method = (form.get("method") or "post").lower()
     parsed = urlparse(cfg.login_url)
     submit_headers = {**HEADERS, "Referer": cfg.login_url, "Origin": f"{parsed.scheme}://{parsed.netloc}"}
-    safe_fields = {k: ("***" if "password" in k.lower() else v) for k, v in data.items()}
+    safe_fields = safe_login_form_fields(data)
     write_site_log(cfg, f"Login form fields: {safe_fields}")
 
     try:
@@ -1267,18 +1269,18 @@ def parse_single_product_stock(html: str, product_url: str) -> dict:
     has_cart_control = has_enabled_add_to_cart_control(soup)
     login_required = "you must register and login to shop" in text_lower
 
-    if is_sold_out:
-        return {
-            "status": "SOLD_OUT",
-            "message": product_name and f"{product_name} appears to be sold out." or "Product appears to be sold out.",
-            "url": product_url,
-            "product_name": product_name,
-            "page_text_sample": text[:800],
-        }
     if has_cart_control:
         return {
             "status": "IN_STOCK",
             "message": product_name and f"{product_name} appears to be available." or "Product appears to be available.",
+            "url": product_url,
+            "product_name": product_name,
+            "page_text_sample": text[:800],
+        }
+    if is_sold_out:
+        return {
+            "status": "SOLD_OUT",
+            "message": product_name and f"{product_name} appears to be sold out." or "Product appears to be sold out.",
             "url": product_url,
             "product_name": product_name,
             "page_text_sample": text[:800],
@@ -1491,6 +1493,11 @@ def parse_collection_products_json_stock(session: requests.Session, cfg: SiteCon
 def build_product_urls(html: str, cfg: SiteConfig) -> list[str]:
     product_links = parse_product_links(html, cfg.product_url, cfg)
     if product_links:
+        if cfg.profile == "koyamaen":
+            write_site_log(
+                cfg,
+                f"Koyamaen catalog listed {len(product_links)} product links; validating stock on each detail page.",
+            )
         return unique_urls(cfg.target_product_urls + product_links)
     if shopify_product_json_url(cfg.product_url):
         return unique_urls(cfg.target_product_urls + [cfg.product_url])
