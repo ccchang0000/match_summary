@@ -146,6 +146,21 @@ def normalize_url_key(value: str) -> str:
     return (value or "").strip().rstrip("/")
 
 
+def is_koyamaen_url(value: str) -> bool:
+    return "marukyu-koyamaen.co.jp" in (value or "").casefold()
+
+
+def safe_debug_filename_part(product_name: str, product_url: str) -> str:
+    normalized_name = re.sub(r"[^a-z0-9]+", "_", (product_name or "").casefold()).strip("_")
+    if normalized_name:
+        return normalized_name[:80]
+
+    path_bits = [bit for bit in urlparse(product_url or "").path.split("/") if bit]
+    slug = path_bits[-1] if path_bits else "product"
+    normalized_slug = re.sub(r"[^a-z0-9]+", "_", slug.casefold()).strip("_")
+    return (normalized_slug or "product")[:80]
+
+
 def now_text() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -278,7 +293,7 @@ class AppConfig:
             enable_local_notification=env_bool("ENABLE_LOCAL_NOTIFICATION", "true"),
             test_telegram=env_bool("TEST_TELEGRAM", "false"),
             simulate_in_stock=env_bool("SIMULATE_IN_STOCK", "false"),
-            debug=env_bool("DEBUG", "false"),
+            debug=env_bool("DEBUG", "FALSE"),
             summary_alert_every_run=env_bool("SUMMARY_ALERT_EVERY_RUN", "false"),
             alert_when_any_in_stock=env_bool("ALERT_WHEN_ANY_IN_STOCK", "true"),
             local_notification_title_max_chars=env_int("LOCAL_NOTIFICATION_TITLE_MAX_CHARS", 63),
@@ -614,6 +629,23 @@ def save_koyamaen_unknown_html(cfg: SiteConfig, product_url: str, html: str, res
     write_site_log(cfg, f"Koyamaen UNKNOWN page_text_sample: {sample}")
 
 
+def save_koyamaen_debug_detail_html(product_url: str, product_name: str, html: str) -> None:
+    if not APP.debug or not is_koyamaen_url(product_url):
+        return
+
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    filename_part = safe_debug_filename_part(product_name, product_url)
+    filename = f"koyamaen_debug_{filename_part}_{timestamp}.html"
+    path = os.path.join(APP.log_dir, filename)
+    try:
+        os.makedirs(APP.log_dir, exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(html or "")
+        write_global_log(f"[koyamaen] DEBUG detail HTML saved: {path}")
+    except Exception as e:
+        write_global_log(f"[koyamaen] DEBUG detail HTML save failed for {product_url}: {e}")
+
+
 # ============================================================
 # Member login
 # ============================================================
@@ -920,6 +952,34 @@ def is_disabled_control(tag) -> bool:
     return tag.has_attr("disabled") or (tag.get("aria-disabled") or "").lower() == "true"
 
 
+def has_sold_out_marker(bits: str) -> bool:
+    return "sold-out" in bits or "variant-sold-out" in bits or has_sold_out_keyword(bits)
+
+
+def is_shipping_calculator_form(tag) -> bool:
+    bits = tag_bits(tag)
+    return (
+        "woocommerce-shipping-calculator" in bits
+        or "calculate shipping" in bits
+        or "shipping & handling fee" in bits
+    )
+
+
+def write_koyamaen_add_to_cart_debug(product_url: str, hit_type: str, tag) -> None:
+    if not is_koyamaen_url(product_url):
+        return
+
+    bits = tag_bits(tag)
+    write_global_log(
+        "[koyamaen] DEBUG add_to_cart_hit "
+        f"product_url={product_url} "
+        f"hit_type={hit_type} "
+        f"disabled={is_disabled_control(tag)} "
+        f"contains_sold_out_keyword={has_sold_out_marker(bits)} "
+        f"tag_bits={trim_text(bits, 300)}"
+    )
+
+
 def has_cart_form_or_add_to_cart_signal(soup: BeautifulSoup) -> bool:
     if soup.select_one('a[href*="add-to-cart="], a[href*="add-to-cart"], [class*="add-to-cart"], [id*="add-to-cart"]'):
         return True
@@ -934,9 +994,10 @@ def has_cart_form_or_add_to_cart_signal(soup: BeautifulSoup) -> bool:
     return False
 
 
-def has_enabled_add_to_cart_control(soup: BeautifulSoup) -> bool:
+def has_enabled_add_to_cart_control(soup: BeautifulSoup, product_url: str = "") -> bool:
     for link in soup.select('a[href*="add-to-cart="], a[href*="add-to-cart"]'):
         if not is_disabled_control(link):
+            write_koyamaen_add_to_cart_debug(product_url, "link", link)
             return True
 
     for control in soup.select("button, input[type='submit'], input[type='button']"):
@@ -946,19 +1007,26 @@ def has_enabled_add_to_cart_control(soup: BeautifulSoup) -> bool:
         if has_sold_out_keyword(control_bits):
             continue
         if any(keyword.casefold() in control_bits for keyword in IN_STOCK_KEYWORDS) or ("add" in control_bits and "cart" in control_bits):
+            write_koyamaen_add_to_cart_debug(product_url, "global_control", control)
             return True
 
     for cart_form in soup.select("form.cart, form[action*='/cart/add'], form[action*='cart/add'], form[action*='cart'], form.product-form"):
+        if is_shipping_calculator_form(cart_form):
+            continue
         form_bits = tag_bits(cart_form)
         if "sold-out" in form_bits or "variant-sold-out" in form_bits or has_sold_out_keyword(form_bits):
             continue
         if "cart" in form_bits:
+            write_koyamaen_add_to_cart_debug(product_url, "form", cart_form)
             return True
         for control in cart_form.select("button, input[type='submit'], input[type='button']"):
             if not is_disabled_control(control) and not has_sold_out_keyword(tag_bits(control)):
+                write_koyamaen_add_to_cart_debug(product_url, "form", control)
                 return True
 
-    if soup.select_one('a[href*="add-to-cart="]'):
+    fallback_link = soup.select_one('a[href*="add-to-cart="]')
+    if fallback_link:
+        write_koyamaen_add_to_cart_debug(product_url, "link", fallback_link)
         return True
 
     cart_forms = soup.select("form.cart, form[action*='/cart/add'], form[action*='cart/add'], form.product-form")
@@ -966,6 +1034,8 @@ def has_enabled_add_to_cart_control(soup: BeautifulSoup) -> bool:
         return False
 
     for cart_form in cart_forms:
+        if is_shipping_calculator_form(cart_form):
+            continue
         form_bits = " ".join(
             value or ""
             for value in [cart_form.get("id"), cart_form.get("name"), " ".join(cart_form.get("class", [])), cart_form.get_text(" ", strip=True)]
@@ -992,6 +1062,7 @@ def has_enabled_add_to_cart_control(soup: BeautifulSoup) -> bool:
             if any(keyword in control_bits for keyword in ["売り切れ", "sold out", "out of stock"]):
                 continue
             if ("add" in control_bits and "cart" in control_bits) or "カートに追加" in control_bits:
+                write_koyamaen_add_to_cart_debug(product_url, "fallback_form", control)
                 return True
     return False
 
@@ -1246,6 +1317,7 @@ def parse_single_product_stock(html: str, product_url: str) -> dict:
     stock_text = remove_sitewide_stock_notice(text)
     text_lower = stock_text.casefold()
     product_name = parse_product_name(soup)
+    save_koyamaen_debug_detail_html(product_url, product_name, html)
 
     shopify_result = parse_embedded_shopify_stock(soup, product_url, text[:800])
     if shopify_result:
@@ -1266,8 +1338,18 @@ def parse_single_product_stock(html: str, product_url: str) -> dict:
         "お取り扱いできません",
     ]
     is_sold_out = has_sold_out_keyword(stock_text)
-    has_cart_control = has_enabled_add_to_cart_control(soup)
+    has_cart_control = has_enabled_add_to_cart_control(soup, product_url)
     login_required = "you must register and login to shop" in text_lower
+    if is_koyamaen_url(product_url):
+        write_global_log(
+            "[koyamaen] DEBUG parse_single_product_stock "
+            f"product_url={product_url} "
+            f"product_name={product_name or ''} "
+            f"is_sold_out={is_sold_out} "
+            f"has_cart_control={has_cart_control} "
+            f"login_required={login_required} "
+            f"stock_text={trim_text(stock_text, 500)}"
+        )
 
     if has_cart_control:
         return {
@@ -1642,7 +1724,7 @@ def add_product_to_cart(session: requests.Session, cfg: SiteConfig, product_url:
         return False
 
     soup = BeautifulSoup(html, "html.parser")
-    if not has_enabled_add_to_cart_control(soup):
+    if not has_enabled_add_to_cart_control(soup, product_url):
         write_site_log(cfg, "Auto add-to-cart skipped: no enabled add-to-cart control found")
         return False
 
