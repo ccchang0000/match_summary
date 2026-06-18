@@ -1351,18 +1351,18 @@ def parse_single_product_stock(html: str, product_url: str) -> dict:
             f"stock_text={trim_text(stock_text, 500)}"
         )
 
-    if has_cart_control:
-        return {
-            "status": "IN_STOCK",
-            "message": product_name and f"{product_name} appears to be available." or "Product appears to be available.",
-            "url": product_url,
-            "product_name": product_name,
-            "page_text_sample": text[:800],
-        }
     if is_sold_out:
         return {
             "status": "SOLD_OUT",
             "message": product_name and f"{product_name} appears to be sold out." or "Product appears to be sold out.",
+            "url": product_url,
+            "product_name": product_name,
+            "page_text_sample": text[:800],
+        }
+    if has_cart_control:
+        return {
+            "status": "IN_STOCK",
+            "message": product_name and f"{product_name} appears to be available." or "Product appears to be available.",
             "url": product_url,
             "product_name": product_name,
             "page_text_sample": text[:800],
