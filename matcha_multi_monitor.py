@@ -1926,15 +1926,34 @@ def save_alerted_in_stock_keys(keys: set[str]) -> None:
         write_global_log(f"Alert state write failed: {e}")
 
 
+def zh_status(status: object) -> str:
+    status_text = str(status or "UNKNOWN")
+    labels = {
+        "IN_STOCK": "有貨",
+        "SOLD_OUT": "售完",
+        "OUT_OF_STOCK": "缺貨",
+        "UNKNOWN": "未知",
+        "SKIPPED": "略過",
+        "FAILED": "失敗",
+        "ERROR": "錯誤",
+        "LOGGED_IN": "已登入",
+        "DISABLED": "未啟用",
+        "AVAILABLE": "可用",
+        "UNAVAILABLE": "不可用",
+    }
+    return labels.get(status_text, status_text)
+
+
 def format_in_stock_result_for_alert(site_result: dict) -> str:
     cfg = site_result["config"]
     stock = site_result.get("stock_result", {})
     shipping = site_result.get("shipping_result", {})
-    product_name = stock.get("product_name") or "Unknown product"
+    product_name = stock.get("product_name") or "未知商品"
     product_url = stock.get("url") or cfg.product_url
 
     lines = [
         f"[{cfg.site_name}]",
+        f"庫存狀態: {zh_status(stock.get('status'))}",
         f"商品: {product_name}",
         f"連結: {product_url}",
     ]
@@ -1944,7 +1963,7 @@ def format_in_stock_result_for_alert(site_result: dict) -> str:
         else:
             add_text = "成功" if stock.get("added_to_cart") else "失敗"
         lines.append(f"自動加入購物車: {add_text}")
-    lines.append(f"寄送 {APP.target_country_name}: {shipping.get('status', 'UNKNOWN')}")
+    lines.append(f"可寄送至 {APP.target_country_name}: {zh_status(shipping.get('status', 'UNKNOWN'))}")
     return "\n".join(lines)
 
 
@@ -1956,21 +1975,22 @@ def format_site_result_for_alert(site_result: dict) -> str:
     error = site_result.get("error")
 
     if error:
-        return f"[{cfg.site_name}]\nERROR: {error}\n"
+        return f"[{cfg.site_name}]\n錯誤: {error}\n"
 
     stock_text = (
-        f"Stock: {stock_result.get('status')}\n"
+        f"庫存狀態: {zh_status(stock_result.get('status'))}\n"
         f"{stock_result.get('message')}\n"
-        f"Product page: {stock_result.get('url', cfg.product_url)}"
+        f"商品頁面: {stock_result.get('url', cfg.product_url)}"
     )
     if "added_to_cart" in stock_result:
-        stock_text += f"\nAuto add-to-cart: {stock_result.get('added_to_cart')}"
+        add_text = "成功" if stock_result.get("added_to_cart") else "失敗"
+        stock_text += f"\n自動加入購物車: {add_text}"
 
-    login_text = f"Member login: {login_result.get('status')}\n{login_result.get('message')}"
+    login_text = f"會員登入: {zh_status(login_result.get('status'))}\n{login_result.get('message')}"
     shipping_text = (
-        f"Shipping to {APP.target_country_name}: {shipping_result.get('status')}\n"
+        f"可寄送至 {APP.target_country_name}: {zh_status(shipping_result.get('status'))}\n"
         f"{shipping_result.get('message')}\n"
-        f"Shipping check page: {shipping_result.get('url', '')}"
+        f"寄送檢查頁面: {shipping_result.get('url', '')}"
     )
     return f"[{cfg.site_name}]\n{login_text}\n\n{stock_text}\n\n{shipping_text}\n"
 
@@ -2102,7 +2122,7 @@ def send_summary_if_needed(results: list[dict]) -> None:
         return
 
     if new_in_stock_results:
-        title = f"Matcha in-stock alert ({len(new_in_stock_results)})"
+        title = f"抹茶補貨通知 ({len(new_in_stock_results)})"
         detail = "\n\n".join(format_in_stock_result_for_alert(result) for result in new_in_stock_results)
         if send_alert(title, detail):
             save_alerted_in_stock_keys(current_keys)
@@ -2127,8 +2147,8 @@ def send_summary_if_needed(results: list[dict]) -> None:
 def simulate_alert(configs: list[SiteConfig]) -> None:
     names = ", ".join(cfg.site_name for cfg in configs if cfg.enabled)
     send_alert(
-        "[SIMULATION] Matcha monitor summary",
-        f"Profiles: {names}\nStock: IN_STOCK simulation\nShipping to {APP.target_country_name}: UNKNOWN simulation",
+        "[模擬] 抹茶補貨通知",
+        f"監控站台: {names}\n庫存狀態: 有貨（模擬）\n可寄送至 {APP.target_country_name}: 未知（模擬）",
     )
 
 
@@ -2179,7 +2199,7 @@ def main() -> None:
             write_global_log("Telegram test skipped: TELEGRAM_BOT_TOKEN or TELEGRAM_CHAT_ID is missing.")
             return
         try:
-            send_telegram_alert("Matcha Multi Monitor Telegram test", f"Notification test at {now_text()}")
+            send_telegram_alert("抹茶監控 Telegram 測試", f"通知測試時間: {now_text()}")
             write_global_log("Telegram test sent")
         except Exception as e:
             write_global_log(f"Telegram test failed: {e}")
