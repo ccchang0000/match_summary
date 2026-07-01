@@ -137,9 +137,85 @@ SITE_DEFAULTS = {
     },
 }
 
+PRODUCT_DISPLAY_NAMES = [
+    ("丸久小山園", "天授", ["Tenju"]),
+    ("丸久小山園", "極長安", ["Kiwami Choan"]),
+    ("丸久小山園", "長安", ["Choan"]),
+    ("丸久小山園", "永寿", ["Eiju"]),
+    ("丸久小山園", "雲鶴", ["Unkaku"]),
+    ("丸久小山園", "金輪", ["Kinrin"]),
+    ("丸久小山園", "和光", ["Wako"]),
+    ("丸久小山園", "又玄", ["Yugen"]),
+    ("丸久小山園", "千木の白", ["Chigi no Shiro"]),
+    ("丸久小山園", "五十鈴", ["Isuzu"]),
+    ("丸久小山園", "青嵐", ["Aoarashi"]),
+    ("一保堂", "閑坐（かんざ）", ["Kanza"]),
+    ("一保堂", "久遠（くおん）", ["Kuon"]),
+    ("一保堂", "雲門の昔（うんもんのむかし）", ["Ummon-no-mukashi", "Ummon no Mukashi"]),
+    ("一保堂", "松韻の昔（しょういんのむかし）", ["Shoin-no-mukashi", "Shoin no Mukashi"]),
+    ("一保堂", "明昔（さやかのむかし）", ["Sayaka-no-mukashi", "Sayaka no Mukashi"]),
+    ("一保堂", "関の白（かんのしろ）", ["Kan-no-shiro", "Kan no Shiro"]),
+    ("一保堂", "幾世の昔（いくよのむかし）", ["Ikuyo-no-mukashi", "Ikuyo no Mukashi"]),
+    ("一保堂", "オーガニック抹茶", ["Organic Matcha"]),
+    ("一保堂", "若き白（わかきしろ）", ["Wakaki-shiro", "Wakaki Shiro"]),
+    ("一保堂", "初昔（はつむかし）", ["Hatsu-mukashi", "Hatsu Mukashi"]),
+    ("堀井七茗園", "令和7年 関西品評会 受賞抹茶", ["R7 Kansai Tea Competition Award Matcha"]),
+    ("堀井七茗園", "宇治風土 宇治 of 宇治", ["Uji Fudo: Uji of Uji", "Uji Fudo Uji of Uji"]),
+    ("堀井七茗園", "令和7年 関西品評会 入賞抹茶", ["R7 Kansai Tea Competition Prize Matcha"]),
+    ("堀井七茗園", "抹茶 長香の昔", ["Matcha Choukou no Mukashi", "Choukou no Mukashi"]),
+    ("堀井七茗園", "抹茶（自園） プレミアム成里乃", ["Matcha Premium Narino", "Premium Narino"]),
+    ("堀井七茗園", "抹茶 誉の昔", ["Matcha Homare no Mukashi", "Homare no Mukashi"]),
+    ("堀井七茗園", "抹茶 七茗の昔", ["Matcha Shichimei no Mukashi", "Shichimei no Mukashi"]),
+    ("堀井七茗園", "抹茶（自園） 成里乃", ["Matcha Narino", "Narino"]),
+    ("堀井七茗園", "抹茶（自園） 奥の山", ["Matcha Okunoyama", "Okunoyama"]),
+    ("堀井七茗園", "抹茶（自園） 無門", ["Matcha Mumon", "Mumon"]),
+    ("堀井七茗園", "抹茶 莵道昔", ["Matcha Todou Mukashi", "Todou Mukashi"]),
+    ("堀井七茗園", "抹茶 縣の白", ["Matcha Agata no Shiro", "Agata no Shiro"]),
+    ("堀井七茗園", "抹茶 宇治昔", ["Matcha Uji Mukashi", "Uji Mukashi"]),
+]
 
 def normalize_product_name(value: str) -> str:
     return re.sub(r"[^a-z0-9]+", " ", (value or "").casefold()).strip()
+
+
+PRODUCT_DISPLAY_LOOKUPS = sorted(
+    [
+        (normalize_product_name(alias), brand, japanese_name)
+        for brand, japanese_name, aliases in PRODUCT_DISPLAY_NAMES
+        for alias in aliases
+        if normalize_product_name(alias)
+    ],
+    key=lambda item: len(item[0]),
+    reverse=True,
+)
+
+
+def product_size_hint(product_name: str) -> str:
+    sizes = re.findall(r"\b\d+(?:\.\d+)?\s*g\b", product_name or "", flags=re.IGNORECASE)
+    return " / ".join(dict.fromkeys(size.replace(" ", "") for size in sizes))
+
+
+def has_japanese_or_chinese_text(value: str) -> bool:
+    return bool(re.search(r"[\u3400-\u9fff\u3040-\u30ff]", value or ""))
+
+
+def telegram_product_name(product_name: str) -> str:
+    raw_name = (product_name or "").strip()
+    if not raw_name:
+        return "未知商品"
+
+    normalized_name = normalize_product_name(raw_name)
+    for lookup_key, brand, japanese_name in PRODUCT_DISPLAY_LOOKUPS:
+        if normalized_name == lookup_key or lookup_key in normalized_name:
+            suffix_parts = [brand]
+            size_hint = product_size_hint(raw_name)
+            if size_hint:
+                suffix_parts.append(size_hint)
+            return f"{japanese_name}（{'・'.join(suffix_parts)}）"
+
+    if has_japanese_or_chinese_text(raw_name):
+        return raw_name
+    return "未知商品（未建立日文對照）"
 
 
 def normalize_url_key(value: str) -> str:
@@ -1897,26 +1973,40 @@ def in_stock_alert_key(site_result: dict) -> str:
     return f"{cfg.profile}|{product_url}|{product_name}"
 
 
-def load_alerted_in_stock_keys() -> set[str]:
+def load_alert_state() -> dict[str, str]:
+    """Load the last known shipping status per in-stock product key.
+
+    Newer state files store {"products": {key: {"shipping_status": ...}}}. Older
+    state files only stored a flat "in_stock_keys" list with no shipping info;
+    those keys are treated as "UNKNOWN" so they get one fresh shipping check.
+    """
     try:
         with open(APP.alert_state_file, "r", encoding="utf-8") as f:
             data = json.load(f)
     except FileNotFoundError:
-        return set()
+        return {}
     except Exception as e:
         write_global_log(f"Alert state read failed: {e}")
-        return set()
+        return {}
 
-    keys = data.get("in_stock_keys", [])
-    if not isinstance(keys, list):
-        return set()
-    return {str(key) for key in keys if key}
+    products = data.get("products")
+    if isinstance(products, dict):
+        return {
+            str(key): str(value.get("shipping_status") or "UNKNOWN")
+            for key, value in products.items()
+            if key and isinstance(value, dict)
+        }
+
+    legacy_keys = data.get("in_stock_keys", [])
+    if isinstance(legacy_keys, list):
+        return {str(key): "UNKNOWN" for key in legacy_keys if key}
+    return {}
 
 
-def save_alerted_in_stock_keys(keys: set[str]) -> None:
+def save_alert_state(state: dict[str, str]) -> None:
     data = {
         "updated_at": now_text(),
-        "in_stock_keys": sorted(keys),
+        "products": {key: {"shipping_status": status} for key, status in sorted(state.items())},
     }
     try:
         os.makedirs(os.path.dirname(APP.alert_state_file), exist_ok=True)
@@ -1944,17 +2034,19 @@ def zh_status(status: object) -> str:
     return labels.get(status_text, status_text)
 
 
-def format_in_stock_result_for_alert(site_result: dict) -> str:
+def format_in_stock_result_for_alert(site_result: dict, is_new: bool = True) -> str:
     cfg = site_result["config"]
     stock = site_result.get("stock_result", {})
     shipping = site_result.get("shipping_result", {})
     product_name = stock.get("product_name") or "未知商品"
+    product_display_name = telegram_product_name(product_name)
     product_url = stock.get("url") or cfg.product_url
+    shipping_status = stock.get("shipping_status") or shipping.get("status", "UNKNOWN")
 
     lines = [
         f"[{cfg.site_name}]",
-        f"庫存狀態: {zh_status(stock.get('status'))}",
-        f"商品: {product_name}",
+        "新商品有貨" if is_new else "寄送狀態更新",
+        f"商品: {product_display_name}",
         f"連結: {product_url}",
     ]
     if "added_to_cart" in stock:
@@ -1963,7 +2055,7 @@ def format_in_stock_result_for_alert(site_result: dict) -> str:
         else:
             add_text = "成功" if stock.get("added_to_cart") else "失敗"
         lines.append(f"自動加入購物車: {add_text}")
-    lines.append(f"可寄送至 {APP.target_country_name}: {zh_status(shipping.get('status', 'UNKNOWN'))}")
+    lines.append(f"可寄送至 {APP.target_country_name}: {zh_status(shipping_status)}")
     return "\n".join(lines)
 
 
@@ -1980,6 +2072,7 @@ def format_site_result_for_alert(site_result: dict) -> str:
     stock_text = (
         f"庫存狀態: {zh_status(stock_result.get('status'))}\n"
         f"{stock_result.get('message')}\n"
+        f"商品: {telegram_product_name(stock_result.get('product_name') or '')}\n"
         f"商品頁面: {stock_result.get('url', cfg.product_url)}"
     )
     if "added_to_cart" in stock_result:
@@ -1995,30 +2088,35 @@ def format_site_result_for_alert(site_result: dict) -> str:
     return f"[{cfg.site_name}]\n{login_text}\n\n{stock_text}\n\n{shipping_text}\n"
 
 
-def site_has_unalerted_in_stock(cfg: SiteConfig, stock_result: dict, alerted_keys: set) -> bool:
-    """True if this site is IN_STOCK with at least one product we have NOT alerted yet.
+def site_needs_shipping_check(cfg: SiteConfig, stock_result: dict, alert_state: dict) -> bool:
+    """True if this site is IN_STOCK with at least one product whose shipping status
+    is not yet confirmed AVAILABLE.
 
     Drives the "log in only when needed" rule: we refresh Koyamaen's ship-to-Taiwan
-    status the moment a NEW product appears, never on empty stock and never again while
-    the same product stays in stock. That keeps logins rare (so the 15-minute run does
-    not look bot-like / risk the Koyamaen account) while still answering "can it ship to
-    Taiwan?" exactly when it matters."""
+    status for a product the moment it appears in stock, and keep rechecking on every
+    run while it stays in stock but shipping is still UNAVAILABLE/UNKNOWN — so a
+    midday shipping-country change is caught instead of only checked once. Once a
+    product's shipping status is confirmed AVAILABLE we stop rechecking it (it already
+    answered the question), which keeps logins rare (so the run does not look bot-like /
+    risk the Koyamaen account) while never missing a stock→available shipping change."""
     if stock_result.get("status") != "IN_STOCK":
         return False
     products = stock_result.get("in_stock_products") or [stock_result]
     for product in products:
         key = in_stock_alert_key({"config": cfg, "stock_result": product})
-        if key not in alerted_keys:
+        if alert_state.get(key, "UNKNOWN") != "AVAILABLE":
             return True
     return False
 
 
-def check_site_once(cfg: SiteConfig, alerted_keys=None) -> dict:
-    # alerted_keys lets us tell a brand-new in-stock product (→ log in + refresh shipping)
-    # from one we already alerted (→ skip the login). Loaded once per run by the caller;
-    # default-load here so direct/test calls still work.
-    if alerted_keys is None:
-        alerted_keys = load_alerted_in_stock_keys()
+def check_site_once(cfg: SiteConfig, alert_state=None) -> dict:
+    # alert_state maps product key -> last known shipping status. It lets us tell a
+    # brand-new in-stock product, or one whose shipping is still not AVAILABLE
+    # (→ log in + refresh shipping), from one already confirmed AVAILABLE (→ skip the
+    # login). Loaded once per run by the caller; default-load here so direct/test calls
+    # still work.
+    if alert_state is None:
+        alert_state = load_alert_state()
 
     site_result = {"config": cfg}
     write_site_log(cfg, "=" * 80)
@@ -2040,7 +2138,7 @@ def check_site_once(cfg: SiteConfig, alerted_keys=None) -> dict:
         follow_up = (
             stock_result["status"] == "IN_STOCK"
             and cfg.enable_login
-            and site_has_unalerted_in_stock(cfg, stock_result, alerted_keys)
+            and site_needs_shipping_check(cfg, stock_result, alert_state)
         )
 
         if follow_up:
@@ -2059,6 +2157,12 @@ def check_site_once(cfg: SiteConfig, alerted_keys=None) -> dict:
             stock_result["added_to_cart"] = products[0].get("added_to_cart") if products else None
 
             shipping_result = check_shipping_to_target(session, cfg)
+            # Record the freshly-checked shipping status on every in-stock product so
+            # send_summary_if_needed can detect a shipping-status change even when the
+            # product itself already triggered an earlier "new stock" alert.
+            for product in products:
+                product["shipping_status"] = shipping_result["status"]
+            stock_result["shipping_status"] = shipping_result["status"]
         else:
             # Out of stock, login disabled, or already alerted (we logged in on an earlier
             # run). Skip the login/cart/shipping round-trip to keep logins minimal.
@@ -2093,17 +2197,17 @@ def check_all_sites_once(configs: list[SiteConfig]) -> list[dict]:
     if not enabled:
         return []
 
-    # Load the de-dup state once so every site sees the same "already alerted" snapshot
-    # when deciding whether this is a new in-stock product worth logging in for.
-    alerted_keys = load_alerted_in_stock_keys()
+    # Load the shipping-state snapshot once so every site sees the same "last known
+    # shipping status per product" view when deciding whether to log in and recheck.
+    alert_state = load_alert_state()
 
     workers = max(1, min(APP.max_site_workers, len(enabled)))
     if workers == 1:
-        return [check_site_once(cfg, alerted_keys) for cfg in enabled]
+        return [check_site_once(cfg, alert_state) for cfg in enabled]
 
     # Sites are independent (own session per call); run them concurrently. map() preserves order.
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        return list(executor.map(lambda cfg: check_site_once(cfg, alerted_keys), enabled))
+        return list(executor.map(lambda cfg: check_site_once(cfg, alert_state), enabled))
 
 
 def send_summary_if_needed(results: list[dict]) -> None:
@@ -2113,30 +2217,46 @@ def send_summary_if_needed(results: list[dict]) -> None:
         write_global_log(line)
 
     current_in_stock_results = in_stock_results(results)
-    current_keys = {in_stock_alert_key(result) for result in current_in_stock_results}
-    previous_keys = load_alerted_in_stock_keys()
-    new_in_stock_results = [result for result in current_in_stock_results if in_stock_alert_key(result) not in previous_keys]
+    previous_state = load_alert_state()
+
+    # A product needs a new alert if it just appeared in stock (no previous record) or
+    # if its shipping status changed since the last alert (e.g. UNAVAILABLE → AVAILABLE
+    # after the site opens shipping to the target country mid-day). Products that were
+    # not rechecked this run (see site_needs_shipping_check) carry their previous status
+    # forward here, so they never look "changed" just because the check was skipped.
+    current_state = {}
+    changed_results = []
+    for result in current_in_stock_results:
+        key = in_stock_alert_key(result)
+        stock = result.get("stock_result", {})
+        shipping_status = stock.get("shipping_status") or previous_state.get(key, "UNKNOWN")
+        current_state[key] = shipping_status
+        if previous_state.get(key) != shipping_status:
+            changed_results.append(result)
 
     if not APP.alert_when_any_in_stock:
         write_global_log("No alert: ALERT_WHEN_ANY_IN_STOCK is false.")
         return
 
-    if new_in_stock_results:
-        title = f"抹茶補貨通知 ({len(new_in_stock_results)})"
-        detail = "\n\n".join(format_in_stock_result_for_alert(result) for result in new_in_stock_results)
+    if changed_results:
+        title = f"抹茶補貨通知 ({len(changed_results)})"
+        detail = "\n\n".join(
+            format_in_stock_result_for_alert(result, is_new=(in_stock_alert_key(result) not in previous_state))
+            for result in changed_results
+        )
         if send_alert(title, detail):
-            save_alerted_in_stock_keys(current_keys)
+            save_alert_state(current_state)
         else:
             write_global_log("Alert was not marked as sent because no notification channel succeeded.")
         return
 
     if current_in_stock_results:
-        write_global_log("No alert: in-stock products were already alerted.")
-        save_alerted_in_stock_keys(current_keys)
+        write_global_log("No alert: in-stock products and shipping status are unchanged since the last alert.")
+        save_alert_state(current_state)
         return
 
     if not any(result.get("error") for result in results):
-        save_alerted_in_stock_keys(set())
+        save_alert_state({})
 
     if APP.summary_alert_every_run or APP.alert_on_unknown_stock:
         write_global_log("No alert: Telegram is configured to notify only when a new target product is in stock.")
