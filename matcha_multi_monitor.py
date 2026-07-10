@@ -191,8 +191,45 @@ PRODUCT_DISPLAY_LOOKUPS = sorted(
 
 
 def product_size_hint(product_name: str) -> str:
-    sizes = re.findall(r"\b\d+(?:\.\d+)?\s*g\b", product_name or "", flags=re.IGNORECASE)
-    return " / ".join(dict.fromkeys(size.replace(" ", "") for size in sizes))
+    sizes = re.findall(r"(?<!\w)\d+(?:\.\d+)?\s*[gｇ](?!\w)", product_name or "", flags=re.IGNORECASE)
+    return " / ".join(dict.fromkeys(size.replace(" ", "").replace("ｇ", "g").replace("Ｇ", "g") for size in sizes))
+
+
+def stock_variant_labels(stock: dict) -> list[str]:
+    labels = stock.get("variant_labels")
+    if isinstance(labels, list):
+        return [str(label).strip() for label in labels if str(label).strip()]
+    label = str(stock.get("variant_label") or "").strip()
+    return [label] if label else []
+
+
+def stock_size_label(stock: dict) -> str:
+    explicit_size = str(stock.get("size_hint") or "").strip()
+    if explicit_size:
+        return explicit_size
+
+    variant_text = " / ".join(stock_variant_labels(stock))
+    variant_size = product_size_hint(variant_text)
+    if variant_size:
+        return variant_size
+
+    return product_size_hint(stock.get("product_name") or "")
+
+
+def stock_variant_key_value(stock: dict) -> str:
+    variant_ids = join_display_values(stock.get("variant_ids") or [])
+    if variant_ids:
+        return variant_ids
+
+    variant_id = stock.get("variant_id")
+    if variant_id not in [None, ""]:
+        return str(variant_id)
+
+    return stock.get("variant_label") or stock_size_label(stock)
+
+
+def join_display_values(values: list[object]) -> str:
+    return " / ".join(dict.fromkeys(str(value).strip() for value in values if str(value).strip()))
 
 
 def has_japanese_or_chinese_text(value: str) -> bool:
@@ -1143,6 +1180,64 @@ def has_enabled_add_to_cart_control(soup: BeautifulSoup, product_url: str = "") 
     return False
 
 
+def variation_row_label(row) -> str:
+    size_text = ""
+    for attr in row.select(".product-attributes dl"):
+        key = attr.select_one("dt")
+        value = attr.select_one("dd")
+        key_text = key.get_text(" ", strip=True).casefold() if key else ""
+        if value and any(marker in key_text for marker in ["size", "容量", "内容量"]):
+            size_text = value.get_text(" ", strip=True)
+            break
+
+    label = size_text or product_size_hint(row.get_text(" ", strip=True))
+    sku = ""
+    for attr in row.select(".product-attributes dl"):
+        key = attr.select_one("dt")
+        value = attr.select_one("dd")
+        key_text = key.get_text(" ", strip=True).casefold() if key else ""
+        if value and "sku" in key_text:
+            sku = value.get_text(" ", strip=True)
+            break
+
+    parts = [label] if label else []
+    if sku:
+        parts.append(f"SKU {sku}")
+    return ", ".join(parts)
+
+
+def available_variation_rows(soup: BeautifulSoup, product_url: str = "") -> list[dict]:
+    variants = []
+    for row in soup.select(".woocommerce-variation, [data-variation_id]"):
+        if row.find_parent("form") and is_shipping_calculator_form(row.find_parent("form")):
+            continue
+
+        enabled_controls = [
+            control
+            for control in row.select("button, input[type='submit'], input[type='button']")
+            if not is_disabled_control(control) and not has_sold_out_keyword(tag_bits(control))
+        ]
+        if not enabled_controls:
+            continue
+
+        row_bits = tag_bits(row)
+        if has_sold_out_marker(row_bits):
+            continue
+
+        for control in enabled_controls:
+            write_koyamaen_add_to_cart_debug(product_url, "variation", control)
+
+        label = variation_row_label(row)
+        variants.append(
+            {
+                "id": row.get("data-variation_id") or "",
+                "label": label,
+                "size_hint": product_size_hint(label),
+            }
+        )
+    return variants
+
+
 def parse_script_json(script_tag):
     raw_json = script_tag.string or script_tag.get_text()
     raw_json = (raw_json or "").strip()
@@ -1162,11 +1257,18 @@ def shopify_product_result_from_data(product: dict, product_url: str, page_sampl
     if product.get("available") is True or available_variants:
         variant_labels = [variant.get("public_title") or variant.get("title") or str(variant.get("id")) for variant in available_variants]
         variant_text = f" Available variants: {', '.join(label for label in variant_labels if label)}." if variant_labels else ""
+        variant_label = join_display_values(variant_labels)
+        variant_ids = [variant.get("id") for variant in available_variants if variant.get("id")]
         return {
             "status": "IN_STOCK",
             "message": product_name and f"{product_name} appears to be available.{variant_text}" or f"Product appears to be available.{variant_text}",
             "url": product_url,
             "product_name": product_name,
+            "variant_label": variant_label,
+            "variant_labels": variant_labels,
+            "variant_ids": variant_ids,
+            "variant_id": variant_ids[0] if variant_ids else None,
+            "size_hint": product_size_hint(variant_label),
             "page_text_sample": page_sample,
         }
 
@@ -1322,6 +1424,10 @@ def parse_shopify_product_stock(product_data: dict, product_url: str) -> dict:
             "url": product_url,
             "product_name": product_name,
             "variant_id": variant.get("id"),
+            "variant_label": variant_label,
+            "variant_labels": [variant_label] if variant_label else [],
+            "variant_ids": [variant.get("id")] if variant.get("id") else [],
+            "size_hint": product_size_hint(variant_label),
             "page_text_sample": sample,
         }
     if shopify_variants(product_data):
@@ -1414,15 +1520,18 @@ def parse_single_product_stock(html: str, product_url: str) -> dict:
         "お取り扱いできません",
     ]
     is_sold_out = has_sold_out_keyword(stock_text)
-    has_cart_control = has_enabled_add_to_cart_control(soup, product_url)
+    available_variants = available_variation_rows(soup, product_url)
+    has_cart_control = bool(available_variants) or has_enabled_add_to_cart_control(soup, product_url)
     login_required = "you must register and login to shop" in text_lower
     if is_koyamaen_url(product_url):
+        variant_labels = [variant.get("label") for variant in available_variants if variant.get("label")]
         write_global_log(
             "[koyamaen] DEBUG parse_single_product_stock "
             f"product_url={product_url} "
             f"product_name={product_name or ''} "
             f"is_sold_out={is_sold_out} "
             f"has_cart_control={has_cart_control} "
+            f"variant_labels={join_display_values(variant_labels)} "
             f"login_required={login_required} "
             f"stock_text={trim_text(stock_text, 500)}"
         )
@@ -1431,11 +1540,18 @@ def parse_single_product_stock(html: str, product_url: str) -> dict:
     # available variant. After disabled buttons and shipping forms are filtered,
     # an enabled cart control is the strongest "buyable" signal.
     if has_cart_control:
+        variant_labels = [variant.get("label") for variant in available_variants if variant.get("label")]
+        variant_ids = [variant.get("id") for variant in available_variants if variant.get("id")]
+        variant_label = join_display_values(variant_labels)
         return {
             "status": "IN_STOCK",
             "message": product_name and f"{product_name} appears to be available." or "Product appears to be available.",
             "url": product_url,
             "product_name": product_name,
+            "variant_label": variant_label,
+            "variant_labels": variant_labels,
+            "variant_ids": variant_ids,
+            "size_hint": product_size_hint(variant_label) or product_size_hint(product_name),
             "page_text_sample": text[:800],
         }
     if is_sold_out:
@@ -1516,7 +1632,11 @@ def is_target_product(cfg: SiteConfig, product_name: str, product_url: str = "")
 
 
 def product_result_label(result: dict) -> str:
-    return result.get("product_name") or result.get("url") or "Unknown product"
+    label = result.get("product_name") or result.get("url") or "Unknown product"
+    size_label = stock_size_label(result)
+    if size_label and size_label not in label:
+        return f"{label} ({size_label})"
+    return label
 
 
 def unique_urls(urls: list[str]) -> list[str]:
@@ -1970,7 +2090,8 @@ def in_stock_alert_key(site_result: dict) -> str:
     stock = site_result.get("stock_result", {})
     product_url = normalize_url_key(stock.get("url") or cfg.product_url)
     product_name = normalize_product_name(stock.get("product_name") or "")
-    return f"{cfg.profile}|{product_url}|{product_name}"
+    variant_key = normalize_product_name(stock_variant_key_value(stock))
+    return f"{cfg.profile}|{product_url}|{product_name}|{variant_key}"
 
 
 def load_alert_state() -> dict[str, str]:
@@ -2042,13 +2163,16 @@ def format_in_stock_result_for_alert(site_result: dict, is_new: bool = True) -> 
     product_display_name = telegram_product_name(product_name)
     product_url = stock.get("url") or cfg.product_url
     shipping_status = stock.get("shipping_status") or shipping.get("status", "UNKNOWN")
+    size_label = stock_size_label(stock)
 
     lines = [
         f"[{cfg.site_name}]",
         "新商品有貨" if is_new else "寄送狀態更新",
         f"商品: {product_display_name}",
-        f"連結: {product_url}",
     ]
+    if size_label:
+        lines.append(f"規格: {size_label}")
+    lines.append(f"連結: {product_url}")
     if "added_to_cart" in stock:
         if not APP.auto_add_to_cart:
             add_text = "未啟用"
@@ -2075,6 +2199,9 @@ def format_site_result_for_alert(site_result: dict) -> str:
         f"商品: {telegram_product_name(stock_result.get('product_name') or '')}\n"
         f"商品頁面: {stock_result.get('url', cfg.product_url)}"
     )
+    size_label = stock_size_label(stock_result)
+    if size_label:
+        stock_text += f"\n規格: {size_label}"
     if "added_to_cart" in stock_result:
         add_text = "成功" if stock_result.get("added_to_cart") else "失敗"
         stock_text += f"\n自動加入購物車: {add_text}"

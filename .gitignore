@@ -16,6 +16,9 @@ state/
 # Local backup of the pre-optimization script (not needed in the repo)
 matcha_multi_monitor_backup_*.py
 
+# Claude scratch area for subagent long outputs and pre-edit backups (see .claude/docs/40-maintenance.md)
+.claude/tmp/
+
 # Personal ops manual — keep local, do not publish
 matcha_multi_monitor_manual.md
 matcha_multi_monitor_manual.pdf
