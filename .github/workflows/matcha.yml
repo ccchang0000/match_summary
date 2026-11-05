@@ -53,12 +53,17 @@ jobs:
       # Restore the "already alerted" state from the previous run so we don't
       # re-notify the same in-stock product every cycle. Picks the most recent cache.
       - name: Restore alert state
+        id: monitor-state
         uses: actions/cache/restore@v4
         with:
           path: state
           key: matcha-alert-state-${{ github.run_id }}
           restore-keys: |
             matcha-alert-state-
+
+      - name: Report missing monitor state
+        if: steps.monitor-state.outputs.cache-matched-key == ''
+        run: echo "::warning::Monitor state cache was not restored; notification history and health counters start fresh."
 
       - name: Run monitor (one-shot)
         env:
@@ -80,12 +85,13 @@ jobs:
           TELEGRAM_VERIFY_SSL: "true"
           # Persisted across runs via the cache steps above/below.
           ALERT_STATE_FILE: "state/matcha_alert_state.json"
-          # Login is ENABLED but LAZY: matcha_multi_monitor.py only logs in when a NEW
-          # in-stock product appears (see check_site_once / site_has_unalerted_in_stock).
-          # Empty stock = no login, and a product that stays in stock is not re-logged-in,
-          # so we keep avoiding the "logging in every 15 min looks bot-like" risk while
-          # refreshing Koyamaen's ship-to-Taiwan status in the SAME cycle stock is found.
-          # (This replaces the old separate matcha_shipping.yml, now retired.)
+          SHIPPING_RECHECK_SECONDS: "3600"
+          HEALTH_FAILURE_THRESHOLD: "3"
+          HEALTH_GAP_SECONDS: "1800"
+          # Optional external watchdog URL, kept secret and never logged.
+          HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}
+          # Shipping checks are lazy: new/unconfirmed stock or expired AVAILABLE
+          # confirmation. Stock parsing can also retry login when anonymous data is missing.
           KOYAMAEN_ENABLE_LOGIN: "true"
           # Secrets — set these under repo Settings > Secrets and variables > Actions.
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}

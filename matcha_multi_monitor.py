@@ -4,6 +4,7 @@ import os
 import random
 import re
 import sys
+import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
@@ -382,6 +383,10 @@ class AppConfig:
     alert_state_file: str
     log_max_bytes: int
     log_backup_count: int
+    shipping_recheck_seconds: int
+    health_failure_threshold: int
+    health_gap_seconds: int
+    healthcheck_url: str
 
     @classmethod
     def from_env(cls) -> "AppConfig":
@@ -427,6 +432,10 @@ class AppConfig:
             alert_state_file=alert_state_file,
             log_max_bytes=env_int("LOG_MAX_BYTES", 5 * 1024 * 1024),
             log_backup_count=env_int("LOG_BACKUP_COUNT", 3),
+            shipping_recheck_seconds=max(60, env_int("SHIPPING_RECHECK_SECONDS", 3600)),
+            health_failure_threshold=max(1, env_int("HEALTH_FAILURE_THRESHOLD", 3)),
+            health_gap_seconds=max(60, env_int("HEALTH_GAP_SECONDS", 1800)),
+            healthcheck_url=os.getenv("HEALTHCHECK_URL", "").strip(),
         )
 
 
@@ -1681,6 +1690,7 @@ def summarize_stock_results(cfg: SiteConfig, results: list[dict], source_url: st
             "total_products": total_products,
             "target_products_checked": len(target_results),
             "in_stock_products": target_in_stock_results,
+            "product_results": target_results,
         }
 
     if not target_results:
@@ -2106,6 +2116,8 @@ def result_summary_line(site_result: dict) -> str:
 def in_stock_results(results: list[dict]) -> list[dict]:
     alert_results = []
     for result in results:
+        if result.get("error"):
+            continue
         stock_result = result.get("stock_result", {})
         if stock_result.get("status") != "IN_STOCK":
             continue
@@ -2125,47 +2137,66 @@ def in_stock_alert_key(site_result: dict) -> str:
     return f"{cfg.profile}|{product_url}|{product_name}|{variant_key}"
 
 
-def load_alert_state() -> dict[str, str]:
-    """Load the last known shipping status per in-stock product key.
-
-    Newer state files store {"products": {key: {"shipping_status": ...}}}. Older
-    state files only stored a flat "in_stock_keys" list with no shipping info;
-    those keys are treated as "UNKNOWN" so they get one fresh shipping check.
-    """
+def load_monitor_state() -> dict:
+    """Load notified products, successful shipping-check times, and site health."""
     try:
         with open(APP.alert_state_file, "r", encoding="utf-8") as f:
             data = json.load(f)
     except FileNotFoundError:
+        write_global_log("Monitor state not found; notification history and health counters start fresh.")
         return {}
     except Exception as e:
-        write_global_log(f"Alert state read failed: {e}")
+        write_global_log(f"Monitor state read failed: {type(e).__name__}")
         return {}
+    if not isinstance(data, dict):
+        write_global_log("Monitor state is not an object; ignoring invalid state.")
+        return {}
+    if not isinstance(data.get("products"), dict):
+        legacy = data.get("in_stock_keys", [])
+        data["products"] = {
+            str(key): {"shipping_status": "UNKNOWN"}
+            for key in legacy if key
+        } if isinstance(legacy, list) else {}
+    return data
 
-    products = data.get("products")
-    if isinstance(products, dict):
-        return {
-            str(key): str(value.get("shipping_status") or "UNKNOWN")
-            for key, value in products.items()
-            if key and isinstance(value, dict)
-        }
 
-    legacy_keys = data.get("in_stock_keys", [])
-    if isinstance(legacy_keys, list):
-        return {str(key): "UNKNOWN" for key in legacy_keys if key}
-    return {}
+def notified_product_state(document: dict) -> dict[str, str]:
+    return {
+        str(key): str(value.get("shipping_status") or "UNKNOWN")
+        for key, value in document.get("products", {}).items()
+        if key and isinstance(value, dict) and value.get("notified", True)
+    }
+
+
+def load_alert_state() -> dict[str, str]:
+    return notified_product_state(load_monitor_state())
+
+
+def save_monitor_state(document: dict) -> None:
+    """Replace state atomically, keeping the previous file if writing fails."""
+    directory = os.path.dirname(APP.alert_state_file)
+    os.makedirs(directory, exist_ok=True)
+    temporary = None
+    try:
+        with tempfile.NamedTemporaryFile(mode="w", encoding="utf-8", dir=directory, suffix=".tmp", delete=False) as f:
+            temporary = f.name
+            json.dump({**document, "version": 2, "updated_at": now_text()}, f, ensure_ascii=False, indent=2)
+            f.flush()
+            os.fsync(f.fileno())
+        os.replace(temporary, APP.alert_state_file)
+    finally:
+        if temporary and os.path.exists(temporary):
+            os.unlink(temporary)
 
 
 def save_alert_state(state: dict[str, str]) -> None:
-    data = {
-        "updated_at": now_text(),
-        "products": {key: {"shipping_status": status} for key, status in sorted(state.items())},
+    document = load_monitor_state()
+    old_products = document.get("products", {})
+    document["products"] = {
+        key: {**old_products.get(key, {}), "shipping_status": status, "notified": True}
+        for key, status in state.items()
     }
-    try:
-        os.makedirs(os.path.dirname(APP.alert_state_file), exist_ok=True)
-        with open(APP.alert_state_file, "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        write_global_log(f"Alert state write failed: {e}")
+    save_monitor_state(document)
 
 
 def zh_status(status: object) -> str:
@@ -2246,35 +2277,37 @@ def format_site_result_for_alert(site_result: dict) -> str:
     return f"[{cfg.site_name}]\n{login_text}\n\n{stock_text}\n\n{shipping_text}\n"
 
 
-def site_needs_shipping_check(cfg: SiteConfig, stock_result: dict, alert_state: dict) -> bool:
-    """True if this site is IN_STOCK with at least one product whose shipping status
-    is not yet confirmed AVAILABLE.
-
-    Drives the "log in only when needed" rule: we refresh Koyamaen's ship-to-Taiwan
-    status for a product the moment it appears in stock, and keep rechecking on every
-    run while it stays in stock but shipping is still UNAVAILABLE/UNKNOWN — so a
-    midday shipping-country change is caught instead of only checked once. Once a
-    product's shipping status is confirmed AVAILABLE we stop rechecking it (it already
-    answered the question), which keeps logins rare (so the run does not look bot-like /
-    risk the Koyamaen account) while never missing a stock→available shipping change."""
+def site_needs_shipping_check(cfg: SiteConfig, stock_result: dict, alert_state: dict, shipping_records=None) -> bool:
+    """Retry unconfirmed shipping each run; periodically refresh AVAILABLE results."""
     if stock_result.get("status") != "IN_STOCK":
         return False
+    if shipping_records is None:
+        shipping_records = load_monitor_state().get("products", {})
     products = stock_result.get("in_stock_products") or [stock_result]
     for product in products:
         key = in_stock_alert_key({"config": cfg, "stock_result": product})
         if alert_state.get(key, "UNKNOWN") != "AVAILABLE":
             return True
+        record = shipping_records.get(key, {})
+        # A detected change whose notification failed must not be hidden by TTL.
+        if isinstance(record, dict) and record.get("observed_shipping_status", alert_state.get(key)) != alert_state.get(key):
+            return True
+        checked_at = record.get("shipping_checked_at", 0) if isinstance(record, dict) else 0
+        if not isinstance(checked_at, (int, float)) or checked_at <= 0:
+            return True
+        age = time.time() - checked_at
+        if age < 0 or age >= APP.shipping_recheck_seconds:
+            return True
     return False
 
 
-def check_site_once(cfg: SiteConfig, alert_state=None) -> dict:
-    # alert_state maps product key -> last known shipping status. It lets us tell a
-    # brand-new in-stock product, or one whose shipping is still not AVAILABLE
-    # (→ log in + refresh shipping), from one already confirmed AVAILABLE (→ skip the
-    # login). Loaded once per run by the caller; default-load here so direct/test calls
-    # still work.
-    if alert_state is None:
-        alert_state = load_alert_state()
+def check_site_once(cfg: SiteConfig, alert_state=None, shipping_records=None) -> dict:
+    if alert_state is None or shipping_records is None:
+        document = load_monitor_state()
+        if alert_state is None:
+            alert_state = notified_product_state(document)
+        if shipping_records is None:
+            shipping_records = document.get("products", {})
 
     site_result = {"config": cfg}
     write_site_log(cfg, "=" * 80)
@@ -2286,9 +2319,8 @@ def check_site_once(cfg: SiteConfig, alert_state=None) -> dict:
 
     session = build_session()
     try:
-        # Stock is detectable WITHOUT logging in, so check it first. Only when a new
-        # in-stock product shows up (and login is enabled for this site) do we log in,
-        # add to cart, and re-check ship-to-Taiwan — all in this same run.
+        # Stock parsing may itself retry after login when anonymous data is missing.
+        # Shipping is checked for new/unconfirmed stock or an expired confirmation.
         html = fetch_page(session, cfg, cfg.product_url)
         stock_result = parse_stock_status(session, cfg, html)
         site_result["stock_result"] = stock_result
@@ -2296,7 +2328,7 @@ def check_site_once(cfg: SiteConfig, alert_state=None) -> dict:
         follow_up = (
             stock_result["status"] == "IN_STOCK"
             and cfg.enable_login
-            and site_needs_shipping_check(cfg, stock_result, alert_state)
+            and site_needs_shipping_check(cfg, stock_result, alert_state, shipping_records)
         )
 
         if follow_up:
@@ -2317,18 +2349,34 @@ def check_site_once(cfg: SiteConfig, alert_state=None) -> dict:
             shipping_result = check_shipping_to_target(
                 session, cfg, product_urls=[product.get("url") or cfg.product_url for product in products]
             )
-            # Record the freshly-checked shipping status on every in-stock product so
-            # send_summary_if_needed can detect a shipping-status change even when the
-            # product itself already triggered an earlier "new stock" alert.
+            shipping_result["checked"] = True
+            checked_at = time.time()
             for product in products:
-                product["shipping_status"] = shipping_result["status"]
-            stock_result["shipping_status"] = shipping_result["status"]
+                key = in_stock_alert_key({"config": cfg, "stock_result": product})
+                if shipping_result["status"] in ("AVAILABLE", "UNAVAILABLE"):
+                    product["shipping_status"] = shipping_result["status"]
+                    product["shipping_checked_at"] = checked_at
+                else:
+                    product["shipping_status"] = alert_state.get(key, "UNKNOWN")
+                    write_site_log(cfg, f"Shipping lookup failed; retaining last-known status: {product['shipping_status']}")
+            stock_result["shipping_status"] = products[0]["shipping_status"]
         else:
-            # Out of stock, login disabled, or already alerted (we logged in on an earlier
-            # run). Skip the login/cart/shipping round-trip to keep logins minimal.
+            products = stock_result.get("in_stock_products") or [stock_result]
+            cached_status = None
+            if stock_result["status"] == "IN_STOCK":
+                for product in products:
+                    key = in_stock_alert_key({"config": cfg, "stock_result": product})
+                    product["shipping_status"] = alert_state.get(key, "UNKNOWN")
+                cached_status = products[0]["shipping_status"]
+            reason = (
+                "NO_STOCK" if stock_result["status"] != "IN_STOCK"
+                else "LOGIN_DISABLED" if not cfg.enable_login else "CACHED"
+            )
             shipping_result = {
-                "status": "UNKNOWN",
-                "message": "Shipping check skipped: only runs when a new in-stock product appears with login enabled.",
+                "status": cached_status or "SKIPPED",
+                "checked": False,
+                "reason": reason,
+                "message": f"Shipping check skipped: {reason}; using last-known status where available.",
                 "url": ", ".join(cfg.shipping_check_urls),
             }
 
@@ -2359,69 +2407,162 @@ def check_all_sites_once(configs: list[SiteConfig]) -> list[dict]:
 
     # Load the shipping-state snapshot once so every site sees the same "last known
     # shipping status per product" view when deciding whether to log in and recheck.
-    alert_state = load_alert_state()
+    document = load_monitor_state()
+    alert_state = notified_product_state(document)
+    shipping_records = document.get("products", {})
 
     workers = max(1, min(APP.max_site_workers, len(enabled)))
     if workers == 1:
-        return [check_site_once(cfg, alert_state) for cfg in enabled]
+        return [check_site_once(cfg, alert_state, shipping_records) for cfg in enabled]
 
     # Sites are independent (own session per call); run them concurrently. map() preserves order.
     with ThreadPoolExecutor(max_workers=workers) as executor:
-        return list(executor.map(lambda cfg: check_site_once(cfg, alert_state), enabled))
+        return list(executor.map(lambda cfg: check_site_once(cfg, alert_state, shipping_records), enabled))
+
+
+def site_failure_reason(result: dict) -> str:
+    """Short health reasons deliberately omit raw URLs, credentials, and responses."""
+    if result.get("error"):
+        return "網站讀取或監控流程失敗"
+    stock = result.get("stock_result", {})
+    if stock.get("status") not in ("IN_STOCK", "SOLD_OUT"):
+        return "庫存資料不足，無法完成判斷"
+    if any(p.get("status") not in ("IN_STOCK", "SOLD_OUT") for p in stock.get("product_results", [])):
+        return "部分商品庫存無法完成判斷"
+    shipping = result.get("shipping_result", {})
+    if shipping.get("checked") and shipping.get("status") not in ("AVAILABLE", "UNAVAILABLE"):
+        return "寄送複查失敗，未取得有效國家選單"
+    return ""
+
+
+def retained_product_records(results: list[dict], records: dict) -> dict:
+    """Only discard old stock when the corresponding observation is conclusive."""
+    by_profile = {result["config"].profile: result for result in results}
+    retained = {}
+    for key, record in records.items():
+        if not isinstance(record, dict):
+            continue
+        parts = key.split("|", 2)
+        result = by_profile.get(parts[0])
+        stock = result.get("stock_result", {}) if result else {}
+        keep = not result or result.get("error") or stock.get("status") not in ("IN_STOCK", "SOLD_OUT")
+        if not keep and stock.get("status") == "IN_STOCK":
+            unknown_urls = {
+                normalize_url_key(product.get("url", ""))
+                for product in stock.get("product_results", [])
+                if product.get("status") not in ("IN_STOCK", "SOLD_OUT")
+            }
+            keep = len(parts) > 1 and parts[1] in unknown_urls
+        if keep:
+            retained[key] = dict(record)
+    return retained
+
+
+def update_monitor_health(results: list[dict], document: dict, now: float) -> None:
+    sites = document.get("sites", {})
+    if not isinstance(sites, dict):
+        sites = {}
+    last_run = document.get("last_run_at")
+    if isinstance(last_run, (int, float)) and now - last_run >= APP.health_gap_seconds:
+        minutes = int((now - last_run) / 60)
+        send_alert("抹茶監控執行間隔異常", f"距上次執行約 {minutes} 分鐘，本次已恢復執行。請檢查 Cloudflare 與 GitHub 排程。")
+    document["last_run_at"] = now
+    for result in results:
+        cfg = result["config"]
+        health = sites.get(cfg.profile, {})
+        if not isinstance(health, dict):
+            health = {}
+        reason = site_failure_reason(result)
+        if reason:
+            failures = health.get("consecutive_failures", 0)
+            health["consecutive_failures"] = (failures if isinstance(failures, int) else 0) + 1
+            health["last_error"] = reason
+            write_site_log(cfg, f"Health: FAILED ({health['consecutive_failures']} consecutive run(s)); {reason}")
+            if health["consecutive_failures"] >= APP.health_failure_threshold and not health.get("alerted"):
+                if send_alert("抹茶監控異常", f"[{cfg.site_name}]\n連續 {health['consecutive_failures']} 輪檢查失敗。\n原因：{reason}\n已保留先前狀態，請查看 Actions Log。"):
+                    health["alerted"] = True
+        else:
+            health["consecutive_failures"] = 0
+            health["last_success_at"] = now
+            health.pop("last_error", None)
+            write_site_log(cfg, "Health: OK")
+            if health.get("alerted"):
+                if send_alert("抹茶監控恢復", f"[{cfg.site_name}] 已恢復正常檢查。"):
+                    health["alerted"] = False
+        sites[cfg.profile] = health
+    document["sites"] = sites
+
+
+def ping_monitor_heartbeat() -> None:
+    # Optional external dead-man monitor. Never expose the secret ping URL in logs.
+    if not APP.healthcheck_url:
+        return
+    try:
+        response = requests.get(APP.healthcheck_url, timeout=10, verify=True)
+        response.raise_for_status()
+        write_global_log("External success heartbeat sent.")
+    except requests.RequestException as e:
+        write_global_log(f"External heartbeat failed: {type(e).__name__}")
 
 
 def send_summary_if_needed(results: list[dict]) -> None:
+    if not results:
+        write_global_log("No site results; preserving monitor state.")
+        return
     summary_lines = [result_summary_line(result) for result in results]
     write_global_log("Run summary:")
     for line in summary_lines:
         write_global_log(line)
 
     current_in_stock_results = in_stock_results(results)
-    previous_state = load_alert_state()
+    document = load_monitor_state()
+    previous_state = notified_product_state(document)
+    old_records = document.get("products", {})
 
     # A product needs a new alert if it just appeared in stock (no previous record) or
     # if its shipping status changed since the last alert (e.g. UNAVAILABLE → AVAILABLE
     # after the site opens shipping to the target country mid-day). Products that were
     # not rechecked this run (see site_needs_shipping_check) carry their previous status
     # forward here, so they never look "changed" just because the check was skipped.
-    current_state = {}
+    current_records = retained_product_records(results, old_records)
     changed_results = []
     for result in current_in_stock_results:
         key = in_stock_alert_key(result)
         stock = result.get("stock_result", {})
         shipping_status = stock.get("shipping_status") or previous_state.get(key, "UNKNOWN")
-        current_state[key] = shipping_status
+        record = dict(old_records.get(key, {}))
+        record.setdefault("notified", key in previous_state)
+        record["observed_shipping_status"] = shipping_status
+        if stock.get("shipping_checked_at") is not None:
+            record["shipping_checked_at"] = stock["shipping_checked_at"]
+        current_records[key] = record
         if previous_state.get(key) != shipping_status:
             changed_results.append(result)
 
-    if not APP.alert_when_any_in_stock:
-        write_global_log("No alert: ALERT_WHEN_ANY_IN_STOCK is false.")
-        return
-
-    if changed_results:
+    if APP.alert_when_any_in_stock and changed_results:
         title = f"抹茶補貨通知 ({len(changed_results)})"
         detail = "\n\n".join(
             format_in_stock_result_for_alert(result, is_new=(in_stock_alert_key(result) not in previous_state))
             for result in changed_results
         )
         if send_alert(title, detail):
-            save_alert_state(current_state)
+            for result in changed_results:
+                key = in_stock_alert_key(result)
+                current_records[key]["notified"] = True
+                current_records[key]["shipping_status"] = current_records[key]["observed_shipping_status"]
         else:
             write_global_log("Alert was not marked as sent because no notification channel succeeded.")
-        return
-
-    if current_in_stock_results:
+    elif not APP.alert_when_any_in_stock:
+        write_global_log("No stock alert: ALERT_WHEN_ANY_IN_STOCK is false.")
+    elif current_in_stock_results:
         write_global_log("No alert: in-stock products and shipping status are unchanged since the last alert.")
-        save_alert_state(current_state)
-        return
-
-    if not any(result.get("error") for result in results):
-        save_alert_state({})
-
-    if APP.summary_alert_every_run or APP.alert_on_unknown_stock:
-        write_global_log("No alert: Telegram is configured to notify only when a new target product is in stock.")
     else:
         write_global_log("No alert: no target product appears in stock.")
+    document["products"] = current_records
+    update_monitor_health(results, document, time.time())
+    save_monitor_state(document)
+    if not any(site_failure_reason(result) for result in results):
+        ping_monitor_heartbeat()
 
 
 def simulate_alert(configs: list[SiteConfig]) -> None:
@@ -2465,6 +2606,10 @@ def main() -> None:
     write_global_log(f"REQUEST_DELAY_SECONDS: {APP.request_delay_seconds}")
     write_global_log(f"LOOP_JITTER_SECONDS: {APP.loop_jitter_seconds}")
     write_global_log(f"MAX_SITE_WORKERS: {APP.max_site_workers}")
+    write_global_log(f"SHIPPING_RECHECK_SECONDS: {APP.shipping_recheck_seconds}")
+    write_global_log(f"HEALTH_FAILURE_THRESHOLD: {APP.health_failure_threshold}")
+    write_global_log(f"HEALTH_GAP_SECONDS: {APP.health_gap_seconds}")
+    write_global_log(f"External heartbeat configured: {bool(APP.healthcheck_url)}")
 
     if not enabled_configs:
         write_global_log("No enabled site profiles. Check SITE_PROFILES or *_ENABLED settings.")
@@ -2488,6 +2633,8 @@ def main() -> None:
     if APP.run_once:
         results = check_all_sites_once(enabled_configs)
         send_summary_if_needed(results)
+        if any(site_failure_reason(result) for result in results):
+            raise SystemExit(1)
         return
 
     while True:
