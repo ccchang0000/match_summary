@@ -110,8 +110,10 @@ SITE_DEFAULTS = {
         "target_product_urls": "",
         "product_link_href_parts": "/english/shop/products/",
         "shipping_check_urls": (
-            "https://www.marukyu-koyamaen.co.jp/english/shop/cart,"
-            "https://www.marukyu-koyamaen.co.jp/english/shop/account/account-addresses"
+            # In-stock product calculators are checked first after login.
+            # The cart calculator is a fallback; account address lists are not
+            # evidence of the destinations offered by the shipping calculator.
+            "https://www.marukyu-koyamaen.co.jp/english/shop/cart"
         ),
     },
     "ippodo": {
@@ -2032,12 +2034,41 @@ def parse_shipping_status(html: str, source_url: str) -> dict:
     }
 
 
-def check_shipping_to_target(session: requests.Session, cfg: SiteConfig) -> dict:
+def parse_koyamaen_shipping_calculator(html: str, source_url: str) -> dict:
+    """Use the actual shipping calculator, never billing/address country lists."""
+    soup = BeautifulSoup(html, "html.parser")
+    calculator = soup.select_one("select#calc_shipping_country, select[name='calc_shipping_country']")
+    if calculator is not None and not calculator.has_attr("disabled"):
+        for option in list(calculator.select("option")):
+            group = option.find_parent("optgroup")
+            if not (option.get("value") or "").strip() or option.has_attr("disabled") or (group and group.has_attr("disabled")):
+                option.decompose()
+        if calculator.select("option"):
+            result = parse_shipping_status(str(calculator), source_url)
+            result["message"] = "Shipping calculator: " + result["message"]
+            return result
+    return {
+        "status": "UNKNOWN",
+        "message": "Shipping calculator country options were not found; member login may be required.",
+        "url": source_url,
+        "page_text_sample": "",
+    }
+
+
+def check_shipping_to_target(session: requests.Session, cfg: SiteConfig, product_urls=None) -> dict:
     results = []
-    for url in cfg.shipping_check_urls:
+    urls = cfg.shipping_check_urls
+    if cfg.profile == "koyamaen":
+        # Re-fetch after login: anonymous product pages hide the calculator.
+        urls = unique_urls(list(product_urls or []) + urls)
+    for url in urls:
         try:
             html = fetch_page(session, cfg, url)
-            result = parse_shipping_status(html, url)
+            result = (
+                parse_koyamaen_shipping_calculator(html, url)
+                if cfg.profile == "koyamaen"
+                else parse_shipping_status(html, url)
+            )
             results.append(result)
             write_site_log(cfg, f"Shipping status from {url}: {result['status']}")
             if result["status"] in ["AVAILABLE", "UNAVAILABLE"]:
@@ -2050,7 +2081,7 @@ def check_shipping_to_target(session: requests.Session, cfg: SiteConfig) -> dict
     return {
         "status": "UNKNOWN",
         "message": "All shipping check URLs failed.",
-        "url": ", ".join(cfg.shipping_check_urls),
+        "url": ", ".join(urls),
         "page_text_sample": "",
     }
 
@@ -2283,7 +2314,9 @@ def check_site_once(cfg: SiteConfig, alert_state=None) -> dict:
                 write_site_log(cfg, f"Auto add-to-cart result for {product_result_label(product)}: {added_to_cart}")
             stock_result["added_to_cart"] = products[0].get("added_to_cart") if products else None
 
-            shipping_result = check_shipping_to_target(session, cfg)
+            shipping_result = check_shipping_to_target(
+                session, cfg, product_urls=[product.get("url") or cfg.product_url for product in products]
+            )
             # Record the freshly-checked shipping status on every in-stock product so
             # send_summary_if_needed can detect a shipping-status change even when the
             # product itself already triggered an earlier "new stock" alert.

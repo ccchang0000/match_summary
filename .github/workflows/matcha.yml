@@ -1,11 +1,11 @@
 name: Matcha Monitor
 
-# Runs the stock check on a schedule (one-shot per run; cron drives the repetition).
+# Runs one stock check per workflow run. Cloudflare Cron should trigger workflow_dispatch;
+# the GitHub schedule below is only a best-effort backup.
 on:
   schedule:
-    # Every 15 minutes. Shorter intervals like */5 are throttled/skipped hardest by GitHub,
-    # so */15 is actually more reliable. GitHub still delays schedules under load; spacing varies.
-    - cron: "*/15 * * * *"
+    # Backup every 15 minutes, offset from :00 because GitHub can delay/drop top-of-hour schedules under load.
+    - cron: "7,22,37,52 * * * *"
   workflow_dispatch:   # lets you trigger a run manually from the Actions tab
     inputs:
       profiles:
