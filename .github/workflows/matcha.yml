@@ -50,6 +50,9 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
+      - name: Run offline regression tests
+        run: python -m unittest discover -s tests -v
+
       # Restore the "already alerted" state from the previous run so we don't
       # re-notify the same in-stock product every cycle. Picks the most recent cache.
       - name: Restore alert state
@@ -90,14 +93,13 @@ jobs:
           HEALTH_GAP_SECONDS: "1800"
           # Optional external watchdog URL, kept secret and never logged.
           HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}
-          # Shipping checks are lazy: new/unconfirmed stock or expired AVAILABLE
-          # confirmation. Stock parsing can also retry login when anonymous data is missing.
-          KOYAMAEN_ENABLE_LOGIN: "true"
+          # Email verification is required at each login. Never submit credentials.
+          KOYAMAEN_PUBLIC_ONLY: "true"
+          KOYAMAEN_ENABLE_LOGIN: "false"
+          KOYAMAEN_PUBLIC_CHANGE_ALERTS: "true"
           # Secrets — set these under repo Settings > Secrets and variables > Actions.
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}
-          KOYAMAEN_LOGIN_EMAIL: ${{ secrets.KOYAMAEN_LOGIN_EMAIL }}
-          KOYAMAEN_LOGIN_PASSWORD: ${{ secrets.KOYAMAEN_LOGIN_PASSWORD }}
         run: python matcha_multi_monitor.py
 
       - name: Save alert state

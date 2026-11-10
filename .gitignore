@@ -1,6 +1,6 @@
-# Keep the repository's existing six-file publishing scope.
-# Everything else stays local: .env, .venv, logs, state, backups, manuals,
-# tests, editor settings, and agent notes/configuration.
+# Publish monitor source, regression tests, and the repair report.
+# Everything else stays local: .env, .venv, logs, state, backups, manual PDFs,
+# editor settings, and agent notes/configuration.
 /*
 
 !/.gitignore
@@ -8,6 +8,11 @@
 !/requirements.txt
 !/matcha_multi_monitor.py
 !/matcha_multi_monitor.env.example
+!/MONITOR_REPAIR_REPORT.md
+!/matcha_multi_monitor_manual.md
+!/tests/
+/tests/*
+!/tests/test_*.py
 
 # Allow only the existing GitHub Actions workflow inside .github.
 !/.github/

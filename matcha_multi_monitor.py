@@ -1,3 +1,4 @@
+import hashlib
 import json
 import logging
 import os
@@ -406,7 +407,7 @@ class AppConfig:
             check_interval_seconds=env_int("CHECK_INTERVAL_SECONDS", 600),
             run_once=env_bool("RUN_ONCE", "false"),
             single_instance=env_bool("SINGLE_INSTANCE", "true"),
-            auto_add_to_cart=env_bool("AUTO_ADD_TO_CART", "true"),
+            auto_add_to_cart=env_bool("AUTO_ADD_TO_CART", "false"),
             alert_on_unknown_stock=env_bool("ALERT_ON_UNKNOWN_STOCK", "false"),
             enable_login=env_bool("ENABLE_LOGIN", "false"),
             telegram_verify_ssl=env_bool("TELEGRAM_VERIFY_SSL", "false"),
@@ -491,7 +492,10 @@ def build_site_config(profile: str) -> SiteConfig:
         login_email=login_email,
         login_password=login_password,
         # Per-site override; defaults to the global ENABLE_LOGIN so the old behavior is preserved.
-        enable_login=env_bool(prefixed_env(profile, "ENABLE_LOGIN"), APP.enable_login),
+        enable_login=(
+            env_bool(prefixed_env(profile, "ENABLE_LOGIN"), APP.enable_login)
+            and not (profile == "koyamaen" and env_bool("KOYAMAEN_PUBLIC_ONLY", True))
+        ),
     )
 
 
@@ -703,7 +707,7 @@ def build_session() -> requests.Session:
         total=APP.http_max_retries,
         backoff_factor=1.0,
         status_forcelist=(429, 500, 502, 503, 504),
-        allowed_methods=frozenset(["GET", "POST"]),
+        allowed_methods=frozenset(["GET"]),
         raise_on_status=False,
     )
     adapter = HTTPAdapter(max_retries=retry)
@@ -897,9 +901,11 @@ def is_logged_in_account_page(html: str) -> bool:
 def login_failure_reason(html: str) -> str:
     text_lower = page_text(html).lower()
     if "missing captcha token" in text_lower:
-        return "Shopify requires a CAPTCHA token for automated login"
+        return "CAPTCHA requires manual verification; automated login stopped"
     if "captcha" in text_lower or "recaptcha" in text_lower:
-        return "captcha challenge may be required"
+        return "CAPTCHA requires manual verification; automated login stopped"
+    if any(marker in text_lower for marker in ("one-time password", "verification code", "two-factor", "two factor", "authentication code")):
+        return "MFA requires manual verification; automated login stopped"
     failure_keywords = [
         "incorrect password",
         "invalid username",
@@ -920,47 +926,89 @@ def login_failure_reason(html: str) -> str:
 
 
 def safe_login_form_fields(data: dict) -> dict:
-    sensitive_names = ("password", "username", "email", "login", "user")
-    return {key: ("***" if any(name in key.lower() for name in sensitive_names) else value) for key, value in data.items()}
+    # Nonces and custom hidden fields can also contain secrets. Log no values.
+    return {key: "***" for key in data}
 
 
 def login_to_member_account(session: requests.Session, cfg: SiteConfig) -> dict:
+    # Stock and lazy shipping share one session and at most one login attempt.
+    if cfg.profile == "koyamaen":
+        cached = getattr(session, "_matcha_login_result", None)
+        if isinstance(cached, dict):
+            return cached
+        result = _login_to_member_account(session, cfg)
+        session._matcha_login_result = result
+        return result
+    return _login_to_member_account(session, cfg)
+
+
+def _login_to_member_account(session: requests.Session, cfg: SiteConfig) -> dict:
     if not cfg.enable_login:
         return {"status": "DISABLED", "message": "Member login is disabled."}
     if not cfg.login_email or not cfg.login_password:
         return {"status": "SKIPPED", "message": f"Member login skipped for {cfg.site_name}: email or password is missing."}
 
     try:
-        login_html = fetch_page(session, cfg, cfg.login_url)
+        response = session.get(cfg.login_url, headers=HEADERS, timeout=30, verify=APP.verify_ssl)
+        response.raise_for_status()
+        login_html = response.text
+        login_page_url = response.url or cfg.login_url
     except Exception as e:
-        return {"status": "FAILED", "message": f"Could not open login page: {e}"}
+        return {"status": "FAILED", "message": f"Could not open login page: {type(e).__name__}"}
 
     if is_logged_in_account_page(login_html):
         return {"status": "LOGGED_IN", "message": "Member login was already active."}
 
     soup = BeautifulSoup(login_html, "html.parser")
+    manual_reason = login_failure_reason(login_html)
+    if "manual verification" in manual_reason:
+        return {"status": "FAILED", "message": manual_reason}
     form = find_login_form(soup)
     if not form:
         return {"status": "FAILED", "message": "Login form was not found on the account page."}
 
     data = build_login_form_data(form, cfg)
-    action_url = urljoin(cfg.login_url, form.get("action") or cfg.login_url)
+    action_url = urljoin(login_page_url, form.get("action") or login_page_url)
     method = (form.get("method") or "post").lower()
-    parsed = urlparse(cfg.login_url)
-    submit_headers = {**HEADERS, "Referer": cfg.login_url, "Origin": f"{parsed.scheme}://{parsed.netloc}"}
+    parsed = urlparse(login_page_url)
+    expected = urlparse(cfg.login_url)
+    action = urlparse(action_url)
+    if (
+        (parsed.scheme, parsed.netloc) != (expected.scheme, expected.netloc)
+        or (action.scheme, action.netloc) != (expected.scheme, expected.netloc)
+        or action.scheme != "https" or method != "post"
+    ):
+        return {"status": "FAILED", "message": "Unexpected login origin or method; credentials were not submitted."}
+    submit_headers = {**HEADERS, "Referer": login_page_url, "Origin": f"{parsed.scheme}://{parsed.netloc}"}
     safe_fields = safe_login_form_fields(data)
     write_site_log(cfg, f"Login form fields: {safe_fields}")
 
     try:
-        write_site_log(cfg, f"Submitting member login form: {action_url}")
-        if method == "get":
-            response = session.get(action_url, params=data, headers=submit_headers, timeout=30, verify=APP.verify_ssl)
-        else:
-            response = session.post(action_url, data=data, headers=submit_headers, timeout=30, verify=APP.verify_ssl)
+        write_site_log(cfg, "Submitting member login form")
+        response = session.post(action_url, data=data, headers=submit_headers, timeout=30,
+                                verify=APP.verify_ssl, allow_redirects=False)
+        # Follow normal same-origin redirects as GET; never replay credentials on
+        # a 307/308 redirect or send them to another origin.
+        for _ in range(5):
+            if response.status_code not in (301, 302, 303):
+                break
+            redirect_url = urljoin(action_url, response.headers.get("Location", ""))
+            redirect = urlparse(redirect_url)
+            if not response.headers.get("Location") or (redirect.scheme, redirect.netloc) != (expected.scheme, expected.netloc):
+                return {"status": "FAILED", "message": "Unexpected login redirect; automated login stopped."}
+            response = session.get(redirect_url, headers=HEADERS, timeout=30,
+                                   verify=APP.verify_ssl, allow_redirects=False)
+            action_url = redirect_url
+        if 300 <= response.status_code < 400:
+            return {"status": "FAILED", "message": "Unsupported login redirect; automated login stopped."}
         response.raise_for_status()
 
         if is_logged_in_account_page(response.text):
             return {"status": "LOGGED_IN", "message": "Member login succeeded."}
+
+        reason = login_failure_reason(response.text)
+        if reason != "login success could not be confirmed":
+            return {"status": "FAILED", "message": f"Member login failed: {reason}."}
 
         account_html = fetch_page(session, cfg, cfg.login_url)
         if is_logged_in_account_page(account_html):
@@ -970,9 +1018,9 @@ def login_to_member_account(session: requests.Session, cfg: SiteConfig) -> dict:
         response = e.response
         if response is not None and response.text:
             return {"status": "FAILED", "message": f"Member login failed: {login_failure_reason(response.text)} ({response.status_code})."}
-        return {"status": "FAILED", "message": f"Member login request failed: {e}"}
+        return {"status": "FAILED", "message": f"Member login request failed: {type(e).__name__}"}
     except Exception as e:
-        return {"status": "FAILED", "message": f"Member login request failed: {e}"}
+        return {"status": "FAILED", "message": f"Member login request failed: {type(e).__name__}"}
 
 
 # ============================================================
@@ -1119,6 +1167,19 @@ def has_cart_form_or_add_to_cart_signal(soup: BeautifulSoup) -> bool:
 
 
 def has_enabled_add_to_cart_control(soup: BeautifulSoup, product_url: str = "") -> bool:
+    if is_koyamaen_url(product_url):
+        # An empty cart form or a disabled link is not availability evidence.
+        # Keep this stricter WooCommerce check local to Koyamaen.
+        for control in soup.select("a[href*='add-to-cart='], button, input[type='submit'], input[type='button']"):
+            if is_disabled_control(control) or control.find_parent(attrs={"disabled": True}):
+                continue
+            form = control.find_parent("form")
+            if form and is_shipping_calculator_form(form):
+                continue
+            bits = tag_bits(control)
+            if not has_sold_out_marker(bits) and any(keyword.casefold() in bits for keyword in IN_STOCK_KEYWORDS):
+                return True
+        return False
     for link in soup.select('a[href*="add-to-cart="], a[href*="add-to-cart"]'):
         if not is_disabled_control(link):
             write_koyamaen_add_to_cart_debug(product_url, "link", link)
@@ -1227,6 +1288,7 @@ def available_variation_rows(soup: BeautifulSoup, product_url: str = "") -> list
             control
             for control in row.select("button, input[type='submit'], input[type='button']")
             if not is_disabled_control(control) and not has_sold_out_keyword(tag_bits(control))
+            and (not is_koyamaen_url(product_url) or any(keyword.casefold() in tag_bits(control) for keyword in IN_STOCK_KEYWORDS))
         ]
         if not enabled_controls:
             continue
@@ -1283,7 +1345,7 @@ def shopify_product_result_from_data(product: dict, product_url: str, page_sampl
             "page_text_sample": page_sample,
         }
 
-    if product.get("available") is False or variants:
+    if product.get("available") is False or (variants and all(variant.get("available") is False for variant in variants)):
         return {
             "status": "SOLD_OUT",
             "message": product_name and f"{product_name} appears to be sold out." or "Product appears to be sold out.",
@@ -1353,6 +1415,8 @@ def parse_embedded_shopify_stock(soup: BeautifulSoup, product_url: str, page_sam
 
 
 def shopify_product_json_url(product_url: str) -> str:
+    if is_koyamaen_url(product_url):
+        return ""  # WooCommerce also uses /products/; this is not a Shopify handle.
     parsed = urlparse(product_url)
     if not parsed.scheme or not parsed.netloc:
         return ""
@@ -1400,7 +1464,7 @@ def shopify_variants(product_data: dict) -> list[dict]:
 
 def first_available_shopify_variant(product_data: dict):
     for variant in shopify_variants(product_data):
-        if variant.get("available"):
+        if variant.get("available") is True:
             return variant
     return None
 
@@ -1441,7 +1505,8 @@ def parse_shopify_product_stock(product_data: dict, product_url: str) -> dict:
             "size_hint": product_size_hint(variant_label),
             "page_text_sample": sample,
         }
-    if shopify_variants(product_data):
+    variants = shopify_variants(product_data)
+    if variants and all(variant.get("available") is False for variant in variants):
         return {
             "status": "SOLD_OUT",
             "message": product_name and f"{product_name} is sold out according to Shopify product JSON." or "Product is sold out according to Shopify product JSON.",
@@ -1671,6 +1736,9 @@ def summarize_stock_results(cfg: SiteConfig, results: list[dict], source_url: st
 
     for result in results:
         target_product = is_target_product(cfg, result.get("product_name", ""), result.get("url", ""))
+        # A failed page has no name to compare; name filters cannot prove it is
+        # irrelevant. Preserve the uncertainty rather than silently dropping it.
+        target_product = target_product or bool(result.get("fetch_failed") and cfg.target_product_names)
         if not target_product:
             if result["status"] == "IN_STOCK":
                 non_target_in_stock_results.append(result)
@@ -1718,6 +1786,7 @@ def summarize_stock_results(cfg: SiteConfig, results: list[dict], source_url: st
             "checked_products": checked_products,
             "total_products": total_products,
             "target_products_checked": len(target_results),
+            "product_results": target_results,
         }
 
     unknown_target_results = [result for result in target_results if result["status"] == "UNKNOWN"]
@@ -1732,6 +1801,7 @@ def summarize_stock_results(cfg: SiteConfig, results: list[dict], source_url: st
         "checked_products": checked_products,
         "total_products": total_products,
         "target_products_checked": len(target_results),
+        "product_results": target_results,
     }
 
 
@@ -1799,6 +1869,35 @@ def build_product_urls(html: str, cfg: SiteConfig) -> list[str]:
     return unique_urls(cfg.target_product_urls)
 
 
+def koyamaen_public_fingerprint(html: str) -> str:
+    """Hash purchase signals only; ignore prices, currencies, scripts and tokens.
+
+    No usable purchase region means no observation (e.g. a challenge/error page).
+    This fingerprint is a change hint, never proof of availability.
+    """
+    soup = BeautifulSoup(html, "html.parser")
+    rows = soup.select(".product-form-row, .woocommerce-variation, [data-variation_id]")
+    if not rows:
+        rows = soup.select("form.cart, .summary")
+    signals = []
+    for row in rows:
+        label = variation_row_label(row)
+        stock = [" ".join(tag.get_text(" ", strip=True).casefold().split()) for tag in row.select(".stock")]
+        controls = []
+        for tag in row.select("button, input[type='submit'], a[href*='add-to-cart=']"):
+            form = tag.find_parent("form")
+            if form and is_shipping_calculator_form(form):
+                continue
+            if any(keyword.casefold() in tag_bits(tag) for keyword in IN_STOCK_KEYWORDS):
+                controls.append(is_disabled_control(tag) or bool(tag.find_parent(attrs={"disabled": True})))
+        if label or stock or controls:
+            signals.append(json.dumps([label, sorted(stock), sorted(controls)], ensure_ascii=False))
+    if not signals:
+        return ""
+    payload = json.dumps(sorted(set(signals)), ensure_ascii=False)
+    return "v1:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+
+
 def parse_product_detail_stock(session: requests.Session, cfg: SiteConfig, product_url: str) -> dict:
     shopify_product_data = fetch_shopify_product_data(session, cfg, product_url)
     if shopify_product_data:
@@ -1806,6 +1905,8 @@ def parse_product_detail_stock(session: requests.Session, cfg: SiteConfig, produ
 
     product_html = fetch_page(session, cfg, product_url)
     result = parse_single_product_stock(product_html, product_url)
+    if cfg.profile == "koyamaen" and not cfg.enable_login:
+        result["public_fingerprint"] = koyamaen_public_fingerprint(product_html)
     if result.get("status") != "UNKNOWN" or cfg.profile != "koyamaen":
         return result
 
@@ -1822,6 +1923,13 @@ def parse_product_detail_stock(session: requests.Session, cfg: SiteConfig, produ
             login_result = login_to_member_account(session, cfg)
             write_site_log(cfg, f"Koyamaen stock retry login status: {login_result['status']}")
             write_site_log(cfg, login_result["message"])
+
+            if login_result["status"] != "LOGGED_IN":
+                result["message"] += " " + login_result["message"]
+                return result
+        else:
+            # This page was already fetched with the session's current auth state.
+            return result
 
         retry_html = fetch_page(session, cfg, product_url)
         retry_result = parse_single_product_stock(retry_html, product_url)
@@ -1843,12 +1951,14 @@ def parse_stock_status(session: requests.Session, cfg: SiteConfig, html: str) ->
     product_urls = build_product_urls(html, cfg)
     if not product_urls:
         result = parse_single_product_stock(html, cfg.product_url)
+        if cfg.profile == "koyamaen" and not cfg.enable_login:
+            result["public_fingerprint"] = koyamaen_public_fingerprint(html)
         if result.get("status") == "UNKNOWN":
             save_koyamaen_unknown_html(cfg, cfg.product_url, html, result)
         if is_target_product(cfg, result.get("product_name", ""), result.get("url", cfg.product_url)):
             return result
         return {
-            "status": "SOLD_OUT",
+            "status": "UNKNOWN",
             "message": f"{product_result_label(result)} is not in the target product list ({format_target_product_filters(cfg)}); skipping stock alert.",
             "url": result.get("url", cfg.product_url),
             "page_text_sample": result.get("page_text_sample", page_text(html)[:800]),
@@ -1870,7 +1980,11 @@ def parse_stock_status(session: requests.Session, cfg: SiteConfig, html: str) ->
             target_label = "target" if is_target_product(cfg, product_name or "", product_url) else "not target"
             write_site_log(cfg, f"Product status: {result['status']} - {product_label}{product_url} ({target_label})")
         except Exception as e:
-            write_site_log(cfg, f"Product detail check failed: {product_url} - {e}")
+            response = getattr(e, "response", None)
+            detail = f"HTTP {response.status_code}" if response is not None else type(e).__name__
+            write_site_log(cfg, f"Product detail check failed: {product_url} - {detail}")
+            results.append({"status": "UNKNOWN", "url": product_url, "product_name": "", "fetch_failed": True,
+                            "message": f"Product detail check failed: {detail}.", "page_text_sample": ""})
 
     return summarize_stock_results(cfg, results, cfg.product_url, len(product_urls))
 
@@ -2316,6 +2430,7 @@ def check_site_once(cfg: SiteConfig, alert_state=None, shipping_records=None) ->
     write_site_log(cfg, f"Shopify collection products JSON URL: {cfg.shopify_products_json_url or 'disabled'}")
     write_site_log(cfg, f"Target product names: {format_target_product_names(cfg)}")
     write_site_log(cfg, f"Target product URLs: {format_target_product_urls(cfg)}")
+    write_site_log(cfg, f"Effective member login enabled: {cfg.enable_login}")
 
     session = build_session()
     try:
@@ -2324,6 +2439,9 @@ def check_site_once(cfg: SiteConfig, alert_state=None, shipping_records=None) ->
         html = fetch_page(session, cfg, cfg.product_url)
         stock_result = parse_stock_status(session, cfg, html)
         site_result["stock_result"] = stock_result
+        cached_login = getattr(session, "_matcha_login_result", None)
+        if isinstance(cached_login, dict):
+            site_result["login_result"] = cached_login
 
         follow_up = (
             stock_result["status"] == "IN_STOCK"
@@ -2394,6 +2512,8 @@ def check_site_once(cfg: SiteConfig, alert_state=None, shipping_records=None) ->
         site_result["error"] = str(e)
         write_site_log(cfg, f"Check failed: {e}")
         return site_result
+    finally:
+        session.close()
 
 
 def check_all_sites_once(configs: list[SiteConfig]) -> list[dict]:
@@ -2425,6 +2545,9 @@ def site_failure_reason(result: dict) -> str:
     if result.get("error"):
         return "網站讀取或監控流程失敗"
     stock = result.get("stock_result", {})
+    login = result.get("login_result", {})
+    if login.get("status") == "FAILED" and "manual verification" in login.get("message", ""):
+        return "會員登入需要 CAPTCHA／MFA 人工驗證，無法完成檢查"
     if stock.get("status") not in ("IN_STOCK", "SOLD_OUT"):
         return "庫存資料不足，無法完成判斷"
     if any(p.get("status") not in ("IN_STOCK", "SOLD_OUT") for p in stock.get("product_results", [])):
@@ -2505,6 +2628,42 @@ def ping_monitor_heartbeat() -> None:
         write_global_log(f"External heartbeat failed: {type(e).__name__}")
 
 
+def update_koyamaen_public_changes(results: list[dict], document: dict) -> None:
+    """Keep change-alert history separate from confirmed stock notifications."""
+    if not env_bool("KOYAMAEN_PUBLIC_CHANGE_ALERTS", True):
+        return
+    previous = document.get("koyamaen_public_pages", {})
+    records = dict(previous) if isinstance(previous, dict) else {}
+    changed = []
+    for result in results:
+        cfg = result["config"]
+        if cfg.profile != "koyamaen" or cfg.enable_login or result.get("error"):
+            continue
+        stock = result.get("stock_result", {})
+        products = stock.get("product_results") or [stock]
+        for product in products:
+            fingerprint = product.get("public_fingerprint")
+            url = normalize_url_key(product.get("url", ""))
+            if not fingerprint or not url:
+                continue  # Failures never erase the last usable observation.
+            old = records.get(url)
+            if not isinstance(old, str) or not old.startswith("v1:") or product.get("status") != "UNKNOWN":
+                records[url] = fingerprint  # First observation establishes a silent baseline.
+            elif old != fingerprint:
+                changed.append((url, fingerprint, product))
+    if changed:
+        detail = "\n\n".join(
+            f"商品: {telegram_product_name(product.get('product_name') or '')}\n連結: {url}"
+            for url, _, product in changed
+        )
+        if send_alert("丸久公開商品頁變動（尚未確認補貨）",
+                      "公開購買區出現變化，庫存仍為 UNKNOWN。請自行登入確認；不代表已補貨或可寄台灣。\n\n" + detail):
+            for url, fingerprint, _ in changed:
+                records[url] = fingerprint
+        # Failed delivery keeps the prior fingerprint so the next run retries.
+    document["koyamaen_public_pages"] = records
+
+
 def send_summary_if_needed(results: list[dict]) -> None:
     if not results:
         write_global_log("No site results; preserving monitor state.")
@@ -2559,6 +2718,7 @@ def send_summary_if_needed(results: list[dict]) -> None:
     else:
         write_global_log("No alert: no target product appears in stock.")
     document["products"] = current_records
+    update_koyamaen_public_changes(results, document)
     update_monitor_health(results, document, time.time())
     save_monitor_state(document)
     if not any(site_failure_reason(result) for result in results):
