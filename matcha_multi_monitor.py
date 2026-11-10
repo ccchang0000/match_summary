@@ -128,7 +128,7 @@ SITE_DEFAULTS = {
         "target_product_urls": (
             "https://global.ippodo-tea.co.jp/collections/matcha/products/matcha5010331,"
             "https://global.ippodo-tea.co.jp/collections/matcha/products/matcha5010431,"
-            "https://global.ippodo-tea.co.jp/collections/matcha/products/matcha6105023,"
+            "https://global.ippodo-tea.co.jp/collections/matcha/products/matcha5010531,"
             "https://global.ippodo-tea.co.jp/collections/matcha/products/matcha5010931,"
             "https://global.ippodo-tea.co.jp/collections/matcha/products/matcha5010831,"
             "https://global.ippodo-tea.co.jp/collections/matcha/products/matcha5018231"
