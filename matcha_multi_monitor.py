@@ -1658,6 +1658,13 @@ def parse_single_product_stock(html: str, product_url: str) -> dict:
             write_global_log(f"Login required, stock unconfirmed for {product_url}; sample: {trim_text(stock_text, 300)}")
         return {
             "status": "UNKNOWN",
+            "unknown_reason": "LOGIN_REQUIRED",
+            "product_page_identified": bool(
+                product_name and soup.select_one("h1")
+                and any(variation_row_label(row) for row in soup.select(
+                    ".product-form-row, .woocommerce-variation, [data-variation_id]"
+                ))
+            ),
             "message": product_name and f"Login required and stock could not be confirmed for {product_name}." or "Login required and stock could not be confirmed.",
             "url": product_url,
             "product_name": product_name,
@@ -2221,7 +2228,7 @@ def result_summary_line(site_result: dict) -> str:
     shipping = site_result.get("shipping_result", {})
     product_label = stock.get("product_name") or stock.get("url") or cfg.product_url
     return (
-        f"[{cfg.site_name}] Stock: {stock.get('status', 'ERROR')} | "
+        f"[{cfg.site_name}] Health: {site_health_status(site_result)} | Stock: {stock.get('status', 'ERROR')} | "
         f"Shipping to {APP.target_country_name}: {shipping.get('status', 'UNKNOWN')} | "
         f"{product_label}"
     )
@@ -2540,6 +2547,38 @@ def check_all_sites_once(configs: list[SiteConfig]) -> list[dict]:
         return list(executor.map(lambda cfg: check_site_once(cfg, alert_state, shipping_records), enabled))
 
 
+def site_degraded_reason(result: dict) -> str:
+    """Only identified Koyamaen public product login walls are expected limits."""
+    cfg = result["config"]
+    if cfg.profile != "koyamaen" or cfg.enable_login or not env_bool("KOYAMAEN_PUBLIC_ONLY", True) or result.get("error"):
+        return ""
+    if result.get("login_result", {}).get("status") == "FAILED":
+        return ""
+    stock = result.get("stock_result", {})
+    if stock.get("status") not in ("UNKNOWN", "IN_STOCK"):
+        return ""
+    products = stock.get("product_results") or [stock]
+    if stock.get("target_products_checked", len(products)) == 0:
+        return ""
+    unknown = [p for p in products if p.get("status") not in ("IN_STOCK", "SOLD_OUT")]
+    if not unknown or not all(
+        p.get("status") == "UNKNOWN" and p.get("unknown_reason") == "LOGIN_REQUIRED"
+        and p.get("product_page_identified") is True and not p.get("fetch_failed")
+        for p in unknown
+    ):
+        return ""
+    shipping = result.get("shipping_result", {})
+    if shipping.get("checked") and shipping.get("status") not in ("AVAILABLE", "UNAVAILABLE"):
+        return ""
+    return "免登入公開頁可讀取，但登入牆遮住庫存；庫存尚未確認"
+
+
+def site_health_status(result: dict) -> str:
+    if site_failure_reason(result):
+        return "FAILED"
+    return "DEGRADED" if site_degraded_reason(result) else "OK"
+
+
 def site_failure_reason(result: dict) -> str:
     """Short health reasons deliberately omit raw URLs, credentials, and responses."""
     if result.get("error"):
@@ -2548,6 +2587,8 @@ def site_failure_reason(result: dict) -> str:
     login = result.get("login_result", {})
     if login.get("status") == "FAILED" and "manual verification" in login.get("message", ""):
         return "會員登入需要 CAPTCHA／MFA 人工驗證，無法完成檢查"
+    if site_degraded_reason(result):
+        return ""
     if stock.get("status") not in ("IN_STOCK", "SOLD_OUT"):
         return "庫存資料不足，無法完成判斷"
     if any(p.get("status") not in ("IN_STOCK", "SOLD_OUT") for p in stock.get("product_results", [])):
@@ -2596,7 +2637,20 @@ def update_monitor_health(results: list[dict], document: dict, now: float) -> No
         if not isinstance(health, dict):
             health = {}
         reason = site_failure_reason(result)
-        if reason:
+        degraded_reason = site_degraded_reason(result)
+        status = "FAILED" if reason else "DEGRADED" if degraded_reason else "OK"
+        if status == "DEGRADED":
+            if health.get("status") != "DEGRADED":
+                health["degraded_alerted"] = False
+            health["consecutive_failures"] = 0
+            health.pop("last_error", None)
+            health["last_degraded_at"] = now
+            write_site_log(cfg, f"Health: DEGRADED; {degraded_reason}")
+            if not health.get("degraded_alerted"):
+                if send_alert("抹茶監控功能受限", f"[{cfg.site_name}]\n{degraded_reason}。\n繼續監控公開頁變動；不代表已確認有貨或售完。"):
+                    health["degraded_alerted"] = True
+                    health["alerted"] = False  # Replace the old failure notice only after delivery.
+        elif reason:
             failures = health.get("consecutive_failures", 0)
             health["consecutive_failures"] = (failures if isinstance(failures, int) else 0) + 1
             health["last_error"] = reason
@@ -2609,9 +2663,11 @@ def update_monitor_health(results: list[dict], document: dict, now: float) -> No
             health["last_success_at"] = now
             health.pop("last_error", None)
             write_site_log(cfg, "Health: OK")
-            if health.get("alerted"):
+            if health.get("alerted") or health.get("degraded_alerted"):
                 if send_alert("抹茶監控恢復", f"[{cfg.site_name}] 已恢復正常檢查。"):
                     health["alerted"] = False
+                    health["degraded_alerted"] = False
+        health["status"] = status
         sites[cfg.profile] = health
     document["sites"] = sites
 
@@ -2626,6 +2682,25 @@ def ping_monitor_heartbeat() -> None:
         write_global_log("External success heartbeat sent.")
     except requests.RequestException as e:
         write_global_log(f"External heartbeat failed: {type(e).__name__}")
+
+
+def write_run_health_summary(results: list[dict]) -> None:
+    """Expose limited coverage even when the Actions job succeeds."""
+    path = os.getenv("GITHUB_STEP_SUMMARY", "")
+    if not path:
+        return
+    lines = ["### Matcha Monitor", "", "| Profile | Health | Stock |", "|---|---|---|"]
+    for result in results:
+        status = result.get("stock_result", {}).get("status", "UNKNOWN")
+        status = status if status in ("IN_STOCK", "SOLD_OUT", "UNKNOWN") else "UNKNOWN"
+        lines.append(f"| {result['config'].profile} | {site_health_status(result)} | {status} |")
+    if any(site_health_status(result) == "DEGRADED" for result in results):
+        lines += ["", "DEGRADED：丸久公開頁可讀取，但庫存尚未確認；工作成功不代表所有商品庫存已確認。"]
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write("\n".join(lines) + "\n")
+    except OSError as e:
+        write_global_log(f"Actions summary write failed: {type(e).__name__}")
 
 
 def update_koyamaen_public_changes(results: list[dict], document: dict) -> None:
@@ -2721,7 +2796,8 @@ def send_summary_if_needed(results: list[dict]) -> None:
     update_koyamaen_public_changes(results, document)
     update_monitor_health(results, document, time.time())
     save_monitor_state(document)
-    if not any(site_failure_reason(result) for result in results):
+    write_run_health_summary(results)
+    if all(site_health_status(result) == "OK" for result in results):
         ping_monitor_heartbeat()
 
 
