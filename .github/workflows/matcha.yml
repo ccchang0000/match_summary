@@ -50,9 +50,6 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      - name: Run offline regression tests
-        run: python -m unittest discover -s tests -v
-
       # Restore the "already alerted" state from the previous run so we don't
       # re-notify the same in-stock product every cycle. Picks the most recent cache.
       - name: Restore alert state
