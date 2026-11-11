@@ -90,10 +90,12 @@ jobs:
           HEALTH_GAP_SECONDS: "1800"
           # Optional external watchdog URL, kept secret and never logged.
           HEALTHCHECK_URL: ${{ secrets.HEALTHCHECK_URL }}
-          # Email verification is required at each login. Never submit credentials.
-          KOYAMAEN_PUBLIC_ONLY: "true"
-          KOYAMAEN_ENABLE_LOGIN: "false"
+          # Try normal login once; manual verification/failure falls back to public stock.
+          KOYAMAEN_PUBLIC_ONLY: "false"
+          KOYAMAEN_ENABLE_LOGIN: "true"
           KOYAMAEN_PUBLIC_CHANGE_ALERTS: "true"
+          KOYAMAEN_LOGIN_EMAIL: ${{ secrets.KOYAMAEN_LOGIN_EMAIL }}
+          KOYAMAEN_LOGIN_PASSWORD: ${{ secrets.KOYAMAEN_LOGIN_PASSWORD }}
           # Secrets — set these under repo Settings > Secrets and variables > Actions.
           TELEGRAM_BOT_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TELEGRAM_CHAT_ID: ${{ secrets.TELEGRAM_CHAT_ID }}

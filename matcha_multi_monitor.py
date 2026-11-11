@@ -1,3 +1,5 @@
+import base64
+import binascii
 import hashlib
 import json
 import logging
@@ -8,7 +10,7 @@ import sys
 import tempfile
 import time
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from logging.handlers import RotatingFileHandler
 from urllib.parse import urljoin, urlparse
@@ -906,6 +908,9 @@ def login_failure_reason(html: str) -> str:
         return "CAPTCHA requires manual verification; automated login stopped"
     if any(marker in text_lower for marker in ("one-time password", "verification code", "two-factor", "two factor", "authentication code")):
         return "MFA requires manual verification; automated login stopped"
+    if any(marker in text_lower for marker in ("email verification", "verify your email", "verification email",
+                                               "check your email", "email confirmation", "confirmation code", "one-time code")):
+        return "Email requires manual verification; automated login stopped"
     failure_keywords = [
         "incorrect password",
         "invalid username",
@@ -1569,6 +1574,128 @@ def looks_like_blocked_or_challenge_page(
     )
 
 
+def koyamaen_stripe_product(soup: BeautifulSoup) -> dict:
+    """Read public JSON without executing JS or returning payment configuration.
+
+    Payment Plugins Stripe 4.0.20 DataTransformer::transform_product maps
+    isInStock directly to WC_Product::is_in_stock(). Bind it to this page's
+    product ID; a parent flag does not identify an available variation.
+    """
+    root = soup.select_one('[id^="product-"][class~="product"]')
+    if root is None or not re.fullmatch(r"product-\d+", root.get("id", "")):
+        return {}
+    product_id = root["id"].split("-", 1)[1]
+    observations = []
+    for script in soup.select("script"):
+        raw = script.string or script.get_text()
+        src = script.get("src", "")
+        if src.startswith("data:text/javascript;base64,"):
+            try:
+                raw = base64.b64decode(src.split(",", 1)[1], validate=True).decode("utf-8")
+            except (ValueError, binascii.Error, UnicodeError):
+                continue
+        elif src:
+            continue  # Never fetch or execute scripts.
+        match = re.search(r"window\s*(?:\[\s*['\"]wcStripeSettings['\"]\s*\]|\.wcStripeSettings)\s*=\s*", raw)
+        if not match:
+            continue
+        try:
+            data, _ = json.JSONDecoder().raw_decode(raw[match.end():])
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(data, dict) or data.get("page") != "product":
+            continue
+        product = data.get("product")
+        if (isinstance(product, dict) and str(product.get("id")) == product_id
+                and type(product.get("isInStock")) is bool):
+            observations.append({key: product.get(key) for key in ("id", "isInStock", "variation_id")})
+    if observations and all(item == observations[0] for item in observations):
+        return observations[0]
+    return {}
+
+
+def parse_koyamaen_public_stock(soup: BeautifulSoup, product_url: str, text: str) -> dict:
+    """Use explicit WooCommerce stock evidence, scoped away from recommendations."""
+    name = parse_product_name(soup)
+    result = {"status": "UNKNOWN", "url": product_url, "product_name": name,
+              "page_text_sample": text[:800]}
+    title = soup.select_one("title")
+    if ((title and title.get_text(strip=True).casefold() in {"just a moment...", "attention required! | cloudflare"})
+            or looks_like_blocked_or_challenge_page(str(soup), soup, text, False)):
+        return {**result, "message": "Challenge page; stock could not be confirmed."}
+    root = soup.select_one('[id^="product-"][class~="product"]')
+    region = BeautifulSoup(str(root or soup), "html.parser")
+    for related in region.select("#product-related, .related, .up-sells, aside"):
+        related.decompose()
+
+    def evidence_status(node):
+        sold = bool(node.select_one(".stock.out-of-stock"))
+        available = bool(node.select_one(".stock.in-stock")) or has_enabled_add_to_cart_control(node, product_url)
+        return "UNKNOWN" if sold and available else "IN_STOCK" if available else "SOLD_OUT" if sold else "UNKNOWN"
+
+    rows = region.select(".product-form-row") or region.select("[data-variation_id]")
+    variants = [{"id": row.get("data-variation_id", ""), "label": variation_row_label(row),
+                 "status": evidence_status(row)} for row in rows]
+    # Standard WooCommerce variation payload, when explicitly exposed publicly.
+    for form in region.select("form[data-product_variations]"):
+        try:
+            payload = json.loads(form["data-product_variations"])
+        except (ValueError, TypeError):
+            continue
+        if not isinstance(payload, list):
+            continue
+        for item in payload:
+            if not isinstance(item, dict) or not item.get("variation_id"):
+                continue
+            vid = str(item["variation_id"])
+            existing = next((v for v in variants if str(v["id"]) == vid), None)
+            attributes = item.get("attributes", {})
+            label = join_display_values(str(v) for v in attributes.values()) if isinstance(attributes, dict) else ""
+            variant = existing or {"id": vid, "label": label, "status": "UNKNOWN"}
+            if not existing:
+                variants.append(variant)
+            if type(item.get("is_in_stock")) is bool:
+                variant["status"] = "IN_STOCK" if item["is_in_stock"] else "SOLD_OUT"
+
+    stripe = koyamaen_stripe_product(soup)
+    parent_status = "UNKNOWN"
+    if stripe:
+        status = "IN_STOCK" if stripe["isInStock"] else "SOLD_OUT"
+        vid = stripe.get("variation_id")
+        if vid in (None, 0):
+            parent_status = status
+        else:
+            variant = next((v for v in variants if str(v["id"]) == str(vid)), None)
+            if variant:
+                variant["status"] = status
+
+    available = [v for v in variants if v["status"] == "IN_STOCK"]
+    variant_status = ("IN_STOCK" if available else "SOLD_OUT" if variants and all(
+        v["status"] == "SOLD_OUT" for v in variants) else "UNKNOWN")
+    # A sold-out marker for one size says nothing about unconfirmed sizes.
+    product_region = BeautifulSoup(str(region), "html.parser")
+    for row in product_region.select(".product-form-row, [data-variation_id], .woocommerce-variation"):
+        row.decompose()
+    explicit_status = variant_status if variant_status != "UNKNOWN" else evidence_status(product_region)
+    conflict = parent_status != "UNKNOWN" and explicit_status != "UNKNOWN" and parent_status != explicit_status
+    status = "UNKNOWN" if conflict else explicit_status if explicit_status != "UNKNOWN" else parent_status
+    result.update(status=status, variant_results=variants,
+                  stock_evidence="CONFLICT" if conflict else "WC_STRIPE_IS_IN_STOCK" if stripe else "WOOCOMMERCE_PURCHASE_REGION")
+    if status == "IN_STOCK" and available:
+        labels = [v["label"] for v in available if v["label"]]
+        result.update(variant_labels=labels, variant_label=join_display_values(labels),
+                      variant_ids=[v["id"] for v in available if v["id"]])
+    if status == "UNKNOWN" and "you must register and login to shop" in text.casefold():
+        result.update(unknown_reason="LOGIN_REQUIRED", product_page_identified=bool(
+            name and soup.select_one("h1") and any(v["label"] for v in variants)))
+    result["message"] = f"{name or 'Product'}: {status}; evidence={result['stock_evidence']}."
+    if status == "IN_STOCK" and variants and not available:
+        result["message"] += " Parent product stock confirmed; available sizes remain UNKNOWN."
+    write_global_log(f"[koyamaen] Public stock: {status}; evidence={result['stock_evidence']}; "
+                     f"variants_confirmed={sum(v['status'] != 'UNKNOWN' for v in variants)}/{len(variants)}")
+    return result
+
+
 def parse_single_product_stock(html: str, product_url: str) -> dict:
     soup = BeautifulSoup(html, "html.parser")
     text = page_text(html)
@@ -1576,6 +1703,9 @@ def parse_single_product_stock(html: str, product_url: str) -> dict:
     text_lower = stock_text.casefold()
     product_name = parse_product_name(soup)
     save_koyamaen_debug_detail_html(product_url, product_name, html)
+
+    if is_koyamaen_url(product_url):
+        return parse_koyamaen_public_stock(soup, product_url, stock_text)
 
     shopify_result = parse_embedded_shopify_stock(soup, product_url, text[:800])
     if shopify_result:
@@ -2355,6 +2485,8 @@ def format_in_stock_result_for_alert(site_result: dict, is_new: bool = True) -> 
     ]
     if size_label:
         lines.append(f"規格: {size_label}")
+    elif stock.get("stock_evidence") == "WC_STRIPE_IS_IN_STOCK" and stock.get("variant_results"):
+        lines.append("規格: 公開資料僅確認商品層級庫存；可購買規格尚未確認")
     lines.append(f"連結: {product_url}")
     if "added_to_cart" in stock:
         if not APP.auto_add_to_cart:
@@ -2441,7 +2573,24 @@ def check_site_once(cfg: SiteConfig, alert_state=None, shipping_records=None) ->
 
     session = build_session()
     try:
-        # Stock parsing may itself retry after login when anonymous data is missing.
+        if cfg.profile == "koyamaen" and cfg.enable_login:
+            login_result = login_to_member_account(session, cfg)
+            write_site_log(cfg, f"Login-first status: {login_result['status']}")
+            if login_result["status"] == "LOGGED_IN":
+                site_result["login_result"] = login_result
+                session._koyamaen_stock_login_attempted = True
+            else:
+                # Do not reuse verification cookies or retry login per product.
+                # A fresh anonymous session keeps the public evidence independent.
+                site_result["login_attempt_result"] = login_result
+                site_result["public_fallback"] = True
+                session.close()
+                session = build_session()
+                cfg = replace(cfg, enable_login=False)
+                site_result["config"] = cfg
+                write_site_log(cfg, "Login unavailable; using a fresh anonymous session for public stock evidence.")
+
+        # Shipping is checked only with an enabled, successful Koyamaen login.
         # Shipping is checked for new/unconfirmed stock or an expired confirmation.
         html = fetch_page(session, cfg, cfg.product_url)
         stock_result = parse_stock_status(session, cfg, html)
@@ -2457,7 +2606,9 @@ def check_site_once(cfg: SiteConfig, alert_state=None, shipping_records=None) ->
         )
 
         if follow_up:
-            login_result = login_to_member_account(session, cfg)
+            login_result = site_result.get("login_result") if cfg.profile == "koyamaen" else None
+            if not isinstance(login_result, dict):
+                login_result = login_to_member_account(session, cfg)
             site_result["login_result"] = login_result
             write_site_log(cfg, f"Member login status: {login_result['status']}")
             write_site_log(cfg, login_result["message"])
@@ -2494,7 +2645,9 @@ def check_site_once(cfg: SiteConfig, alert_state=None, shipping_records=None) ->
                     product["shipping_status"] = alert_state.get(key, "UNKNOWN")
                 cached_status = products[0]["shipping_status"]
             reason = (
-                "NO_STOCK" if stock_result["status"] != "IN_STOCK"
+                "NO_STOCK" if stock_result["status"] == "SOLD_OUT"
+                else "STOCK_UNKNOWN" if stock_result["status"] != "IN_STOCK"
+                else "LOGIN_FAILED_PUBLIC_FALLBACK" if site_result.get("public_fallback")
                 else "LOGIN_DISABLED" if not cfg.enable_login else "CACHED"
             )
             shipping_result = {
@@ -2550,7 +2703,8 @@ def check_all_sites_once(configs: list[SiteConfig]) -> list[dict]:
 def site_degraded_reason(result: dict) -> str:
     """Only identified Koyamaen public product login walls are expected limits."""
     cfg = result["config"]
-    if cfg.profile != "koyamaen" or cfg.enable_login or not env_bool("KOYAMAEN_PUBLIC_ONLY", True) or result.get("error"):
+    if (cfg.profile != "koyamaen" or cfg.enable_login or result.get("error")
+            or not (env_bool("KOYAMAEN_PUBLIC_ONLY", True) or result.get("public_fallback"))):
         return ""
     if result.get("login_result", {}).get("status") == "FAILED":
         return ""
@@ -2610,13 +2764,12 @@ def retained_product_records(results: list[dict], records: dict) -> dict:
         result = by_profile.get(parts[0])
         stock = result.get("stock_result", {}) if result else {}
         keep = not result or result.get("error") or stock.get("status") not in ("IN_STOCK", "SOLD_OUT")
-        if not keep and stock.get("status") == "IN_STOCK":
-            unknown_urls = {
-                normalize_url_key(product.get("url", ""))
-                for product in stock.get("product_results", [])
-                if product.get("status") not in ("IN_STOCK", "SOLD_OUT")
-            }
-            keep = len(parts) > 1 and parts[1] in unknown_urls
+        products = stock.get("product_results", [])
+        if result and not result.get("error") and products:
+            matching = [p for p in products if len(parts) > 1 and normalize_url_key(p.get("url", "")) == parts[1]]
+            # A known sold-out product must reset even when another product is
+            # UNKNOWN. Missing/unknown products never erase notification history.
+            keep = not matching or any(p.get("status") not in ("IN_STOCK", "SOLD_OUT") for p in matching)
         if keep:
             retained[key] = dict(record)
     return retained
@@ -2706,6 +2859,7 @@ def write_run_health_summary(results: list[dict]) -> None:
 def update_koyamaen_public_changes(results: list[dict], document: dict) -> None:
     """Keep change-alert history separate from confirmed stock notifications."""
     if not env_bool("KOYAMAEN_PUBLIC_CHANGE_ALERTS", True):
+        write_global_log("[koyamaen] Public change alerts disabled.")
         return
     previous = document.get("koyamaen_public_pages", {})
     records = dict(previous) if isinstance(previous, dict) else {}
@@ -2724,6 +2878,8 @@ def update_koyamaen_public_changes(results: list[dict], document: dict) -> None:
             old = records.get(url)
             if not isinstance(old, str) or not old.startswith("v1:") or product.get("status") != "UNKNOWN":
                 records[url] = fingerprint  # First observation establishes a silent baseline.
+                if not isinstance(old, str) or not old.startswith("v1:"):
+                    write_global_log("[koyamaen] Public page baseline established; no change alert on first observation.")
             elif old != fingerprint:
                 changed.append((url, fingerprint, product))
     if changed:
@@ -2735,6 +2891,8 @@ def update_koyamaen_public_changes(results: list[dict], document: dict) -> None:
                       "公開購買區出現變化，庫存仍為 UNKNOWN。請自行登入確認；不代表已補貨或可寄台灣。\n\n" + detail):
             for url, fingerprint, _ in changed:
                 records[url] = fingerprint
+        else:
+            write_global_log("[koyamaen] Public change alert delivery failed; will retry next run.")
         # Failed delivery keeps the prior fingerprint so the next run retries.
     document["koyamaen_public_pages"] = records
 
